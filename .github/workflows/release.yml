@@ -99,6 +99,10 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
+      # gh --generate-notes shells out to git, so the job needs a working tree.
+      # Without this the step dies with "failed to run git: fatal: not a git repository".
+      - uses: actions/checkout@v4
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

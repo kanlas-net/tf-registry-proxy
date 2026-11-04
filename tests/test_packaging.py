@@ -195,6 +195,27 @@ class ReleaseEngineeringTest(unittest.TestCase):
         self.assertIn("type=raw,value=latest", text)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_jobs_that_shell_out_to_git_or_gh_check_the_tree_out(self):
+        """``gh`` and ``git`` need a working tree, and a job starts without one.
+
+        The release job failed with "failed to run git: fatal: not a git
+        repository" because it only called gh and never checked anything out.
+        """
+        import yaml
+
+        for name in ("ci.yml", "release.yml"):
+            document = yaml.safe_load(self.workflow(name))
+            for job_id, job in document["jobs"].items():
+                steps = job.get("steps", [])
+                script = "\n".join(str(step.get("run", "")) for step in steps)
+                if not re.search(r"\b(gh|git)\s", script):
+                    continue
+                self.assertTrue(
+                    any(str(step.get("uses", "")).startswith("actions/checkout") for step in steps),
+                    f"{name}:{job_id} runs gh/git without actions/checkout",
+                )
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
     def test_release_tag_filter_actually_matches_the_version_tag(self):
         """A tag filter that never matches silently publishes nothing.
 
