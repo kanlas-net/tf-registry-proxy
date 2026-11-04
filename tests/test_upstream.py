@@ -18,6 +18,10 @@ class HeadersTest(unittest.TestCase):
         self.assertEqual(headers["X-TERRAFORM-GET"], "https://example.com/a.zip")
         self.assertIn("x-Terraform-get", headers)
         self.assertIsNone(headers.get("absent"))
+        headers.update({"X-Terraform-Get": "y"})
+        self.assertEqual(headers.get("x-terraform-get"), "y")
+        self.assertEqual(len(headers), 1, "update must not add a second spelling of the name")
+        self.assertEqual(headers.pop("X-TERRAFORM-GET"), "y")
 
     def test_response_coerces_a_plain_dict(self):
         response = UpstreamResponse(status=204, body=b"", headers={"X-Terraform-Get": "x"})
@@ -110,6 +114,13 @@ class ArchiveDownloaderTest(unittest.TestCase):
     def test_unreachable_source(self):
         with self.assertRaises(UpstreamError):
             ArchiveDownloader().fetch("http://127.0.0.1:1/nope.zip")
+
+    def test_local_schemes_are_refused(self):
+        """A non-HTTP source must never be fetched, whatever the upstream claimed."""
+        for url in ("file:///etc/passwd", "/etc/passwd", "ftp://host/a.zip"):
+            with self.subTest(url=url):
+                with self.assertRaises(UpstreamError):
+                    ArchiveDownloader().fetch(url)
 
     def test_expected_checksum_mismatch(self):
         url = f"{self.registry.base_url}/archives/hashicorp-big-aws-1.0.0.zip"

@@ -137,7 +137,7 @@ class S3Storage(Storage):
                     continue
                 raise
             except urllib.error.URLError as exc:
-                if attempt < self.retries:
+                if attempt < self.retries and replayable(data):
                     attempt += 1
                     time.sleep(min(0.4 * attempt, 2.0))
                     continue
@@ -396,3 +396,17 @@ def rewind(data) -> None:
         seek(0)
     except (OSError, ValueError):  # pragma: no cover - unseekable body
         pass
+
+
+def replayable(data) -> bool:
+    """Can the request body be sent again? A stream that cannot seek must not be retried."""
+    if data is None or isinstance(data, (bytes, bytearray, memoryview)):
+        return True
+    tell = getattr(data, "tell", None)
+    if tell is None:
+        return False
+    try:
+        tell()
+    except (OSError, ValueError):  # pragma: no cover - unseekable body
+        return False
+    return True

@@ -43,10 +43,12 @@ def _split_module(address: str) -> tuple[str, str, str, Optional[str]]:
     Raises ``ValueError`` (not ``SystemExit``) so a bad address in a list of many is
     reported per address instead of aborting the whole command.
     """
-    left, _, version = address.partition("@")
+    left, at, version = address.partition("@")
     parts = left.split("/")
     if len(parts) != 3:
         raise ValueError(f"module must look like namespace/name/provider[@version], got {address!r}")
+    if at and not version:
+        raise ValueError(f"empty version after '@' in {address!r}")
     return parts[0], parts[1], parts[2], version or None
 
 

@@ -56,6 +56,13 @@ class Headers(dict):
     def get(self, name: str, default=None):
         return super().get(str(name).lower(), default)
 
+    def update(self, other=(), **kwargs) -> None:  # pragma: no cover - defensive
+        for name, value in dict(other or {}, **kwargs).items():
+            self[name] = value
+
+    def pop(self, name, *default):
+        return super().pop(str(name).lower(), *default)
+
     def __contains__(self, name: object) -> bool:
         return super().__contains__(str(name).lower())
 
@@ -148,6 +155,11 @@ class ArchiveDownloader:
         self._opener = opener or urllib.request.urlopen
 
     def fetch(self, url: str, *, expected_sha256: Optional[str] = None) -> "DownloadedArchive":
+        scheme, _sep, _rest = url.partition("://")
+        if scheme.lower() not in ("http", "https"):
+            # Defence in depth: the proxy must never fetch a local or exotic scheme, even
+            # if a caller hands it a source that skipped the cacheable check.
+            raise UpstreamError(502, f"refusing to fetch a {scheme or 'schemeless'} URL")
         request = urllib.request.Request(url, method="GET")
         request.add_header("User-Agent", self.user_agent)
         try:

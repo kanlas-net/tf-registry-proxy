@@ -18,7 +18,7 @@ class SplitModuleTest(unittest.TestCase):
 
     def test_malformed_address_raises_value_error_not_system_exit(self):
         # SystemExit escapes ``except Exception`` and killed the whole prefetch command.
-        for address in ("consul", "a/b", "a/b/c/d"):
+        for address in ("consul", "a/b", "a/b/c/d", "a/b/c@"):
             with self.subTest(address=address):
                 with self.assertRaises(ValueError):
                     _split_module(address)

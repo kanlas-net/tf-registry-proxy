@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from tfproxy.config import S3Config
-from tfproxy.errors import NotFound
+from tfproxy.errors import NotFound, StorageError, UpstreamError
 from tfproxy.storage.s3 import S3Storage
 from tests.support.fake_s3 import FakeS3
 
@@ -100,6 +100,31 @@ class S3StorageTest(unittest.TestCase):
         storage = S3Storage(self.cfg, opener=flaky, retries=2)
         storage.put_file("modules/a.zip", path)
         self.assertEqual(sent, [b"0123456789"], "the retry must send the whole body again")
+
+    def test_unseekable_body_is_not_retried(self):
+        """A stream we cannot rewind must fail loudly instead of uploading nothing."""
+        import urllib.error
+
+        calls: list[str] = []
+
+        class Unseekable:
+            def read(self, size=-1):
+                return b"chunk"
+
+            def seekable(self):
+                return False
+
+            def tell(self):
+                raise OSError("unseekable")
+
+        def flaky(request, timeout=None):
+            calls.append(request.get_method())
+            raise urllib.error.URLError("connection reset by peer")
+
+        storage = S3Storage(self.cfg, opener=flaky, retries=2)
+        with self.assertRaises(StorageError):
+            storage._request("PUT", "modules/a.zip", data=Unseekable(), content_length=5)
+        self.assertEqual(calls, ["PUT"], "an unrewindable body must not be sent twice")
 
     def test_put_file_stores_sha_metadata(self):
         with tempfile.NamedTemporaryFile("wb", suffix=".zip", delete=False) as handle:
