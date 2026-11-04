@@ -93,7 +93,7 @@ class DockerfileTest(unittest.TestCase):
             for line in read(".dockerignore").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         }
-        needed = ("LICENSE", "README.md", "CHANGELOG.md", "pyproject.toml", "docker-compose.yml", "examples", "tests", "tfproxy")
+        needed = ("LICENSE", "README.md", "CHANGELOG.md", "AGENTS.md", "pyproject.toml", "docker-compose.yml", "examples", "tests", "tfproxy")
         for name in needed:
             with self.subTest(path=name):
                 self.assertNotIn(name, patterns, f"{name} must stay in the build context")
@@ -252,6 +252,65 @@ class ReleaseEngineeringTest(unittest.TestCase):
         self.assertTrue(matches("feature/**", "feature/a/b"))
         self.assertTrue(matches("v[0-9]*", "v12"))
         self.assertFalse(matches("v[0-9]*", "vx"))
+
+
+class RepositoryLanguageTest(unittest.TestCase):
+    """The project is public and documented in one language."""
+
+    SUFFIXES = (".py", ".md", ".yml", ".yaml", ".toml", ".tf", ".txt", ".cfg", ".ini")
+
+    def test_no_cyrillic_anywhere_in_the_repository(self):
+        offenders = []
+        for dirpath, dirnames, filenames in os.walk(ROOT):
+            dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__", ".venv", "cache", ".tf-cache"}]
+            for filename in filenames:
+                if not filename.endswith(self.SUFFIXES):
+                    continue
+                path = os.path.join(dirpath, filename)
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    if re.search(r"[\u0400-\u04FF]", handle.read()):
+                        offenders.append(os.path.relpath(path, ROOT))
+        self.assertEqual(offenders, [], f"cyrillic text found in: {offenders}")
+
+
+class AgentsGuideTest(unittest.TestCase):
+    """AGENTS.md is the entry point for coding agents: stale instructions are worse than none."""
+
+    def test_the_guide_exists_and_states_the_test_command(self):
+        text = read("AGENTS.md")
+        self.assertIn("unittest discover", text, "the guide must say how to run the suite")
+        self.assertIn("standard library", text.lower(), "the stdlib-only rule is the first thing an agent breaks")
+
+    def test_every_test_the_guide_cites_can_be_loaded(self):
+        """A citation to a test that does not exist sends an agent hunting for a phantom."""
+        import importlib
+
+        text = read("AGENTS.md")
+
+        dotted = set(re.findall(r"\btests\.[a-z_][a-z_0-9]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,2}", text))
+        self.assertTrue(dotted, "the guide should point at concrete tests")
+        loader = unittest.TestLoader()
+        for citation in sorted(dotted):
+            with self.subTest(citation=citation):
+                loader.errors = []
+                suite = loader.loadTestsFromName(citation)
+                self.assertFalse(loader.errors, f"{citation} does not import: {loader.errors}")
+                self.assertGreater(suite.countTestCases(), 0, f"{citation} resolves to no tests")
+
+        test_dir = os.path.join(ROOT, "tests")
+        test_modules = sorted(
+            f"tests.{filename[:-3]}"
+            for filename in os.listdir(test_dir)
+            if filename.startswith("test_") and filename.endswith(".py")
+        )
+        for cls, method in sorted(set(re.findall(r"`([A-Z]\w+Test)\.([a-z_][a-z_0-9]+)`", text))):
+            with self.subTest(citation=f"{cls}.{method}"):
+                hits = [
+                    module
+                    for module in (importlib.import_module(name) for name in sorted(test_modules))
+                    if hasattr(module, cls) and hasattr(getattr(module, cls), method)
+                ]
+                self.assertTrue(hits, f"{cls}.{method} is not defined by any test module")
 
 
 class ReadmeTest(unittest.TestCase):
