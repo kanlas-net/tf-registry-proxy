@@ -17,6 +17,43 @@ def read(name: str) -> str:
         return handle.read()
 
 
+def github_glob_to_regex(pattern: str) -> str:
+    """Translate a GitHub Actions filter pattern into a regex.
+
+    Mirrors the "Filter pattern cheat sheet" in the workflow syntax reference:
+    ``**`` spans ``/``, ``*`` stops at ``/``, ``?`` and ``+`` quantify the
+    preceding character and ``[...]`` is an alphanumeric class. Everything else
+    is literal -- these are globs, not regular expressions.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("**", index):
+            out.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            out.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            out.append("[^/]")
+            index += 1
+        elif pattern[index] == "+":
+            out.append("+")
+            index += 1
+        elif pattern[index] == "[":
+            end = pattern.find("]", index + 1)
+            if end < 0:
+                out.append(re.escape(pattern[index]))
+                index += 1
+            else:
+                out.append(pattern[index : end + 1])
+                index = end + 1
+        else:
+            out.append(re.escape(pattern[index]))
+            index += 1
+    return "".join(out)
+
+
 def env_names_in_code() -> set[str]:
     return set(re.findall(r'"(TFP_[A-Z0-9_]+)"', read("tfproxy/config.py")))
 
@@ -151,14 +188,49 @@ class ReleaseEngineeringTest(unittest.TestCase):
 
         document = yaml.safe_load(self.workflow("release.yml"))
         self.assertEqual(document["permissions"]["packages"], "write")
-        # PyYAML resolves the bare key ``on`` as the boolean True.
-        triggers = document["on"] if "on" in document else document[True]
-        self.assertIn("v[0-9]+.[0-9]+.[0-9]+*", triggers["push"]["tags"])
         text = self.workflow("release.yml")
         self.assertIn("ghcr.io", text)
         self.assertIn("tfproxy.__version__", text, "the tag must be checked against the package version")
         self.assertIn("type=semver,pattern={{version}}", text)
         self.assertIn("type=raw,value=latest", text)
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_release_tag_filter_actually_matches_the_version_tag(self):
+        """A tag filter that never matches silently publishes nothing.
+
+        The first version of this workflow used ``v[0-9]+.[0-9]+.[0-9]+*`` and
+        pushed v1.0.0 without a single release run appearing, so match the
+        patterns instead of comparing them as strings.
+        """
+        import yaml
+
+        document = yaml.safe_load(self.workflow("release.yml"))
+        # PyYAML resolves the bare key ``on`` as the boolean True.
+        triggers = document["on"] if "on" in document else document[True]
+        patterns = triggers["push"]["tags"]
+        self.assertTrue(patterns, "release.yml must trigger on a tag push")
+
+        def matches(ref: str) -> bool:
+            return any(re.fullmatch(github_glob_to_regex(p), ref) for p in patterns)
+
+        self.assertTrue(matches(f"v{tfproxy.__version__}"), "the tag we tag releases with must trigger")
+        self.assertTrue(matches("v1.0.0"))
+        self.assertTrue(matches("v10.20.30"))
+        self.assertFalse(matches("v1"), "a bare major is not a release")
+        self.assertFalse(matches("v1.2"), "a bare major.minor is not a release")
+        self.assertFalse(matches("latest"))
+        self.assertFalse(matches("release-v1.0.0"))
+
+    def test_glob_translator_follows_the_github_cheat_sheet(self):
+        def matches(pattern: str, ref: str) -> bool:
+            return re.fullmatch(github_glob_to_regex(pattern), ref) is not None
+
+        self.assertTrue(matches("v*.*.*", "v1.0.0"))
+        self.assertTrue(matches("feature/*", "feature/my-branch"))
+        self.assertFalse(matches("feature/*", "feature/a/b"), "* must not cross a slash")
+        self.assertTrue(matches("feature/**", "feature/a/b"))
+        self.assertTrue(matches("v[0-9]*", "v12"))
+        self.assertFalse(matches("v[0-9]*", "vx"))
 
 
 class ReadmeTest(unittest.TestCase):

@@ -9,7 +9,10 @@ name: Release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    # Glob, not a regex: ``*`` never matches ``/``. ``v*.*.*`` covers v1.0.0 and
+    # v1.0.0-rc.1 while refusing v1 and v1.2. The verify job below still has to
+    # agree with tfproxy.__version__, so a stray match fails instead of publishing.
+    tags: ["v*.*.*"]
 
 permissions:
   contents: write
