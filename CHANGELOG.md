@@ -1,35 +1,36 @@
 # Changelog
 
-Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версионирование —
-[SemVer](https://semver.org/lang/ru/). Релиз помечен git-тегом `vX.Y.Z`, он же
-публикует образ в `ghcr.io`.
+The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), the versioning is
+[SemVer](https://semver.org/). A release is marked by a git tag `vX.Y.Z`, which is also what
+publishes the image to `ghcr.io`.
 
 ## [1.0.0] - 2026-11-04
 
-Первый публичный релиз. Протокол модулей Terraform (registry protocol v1) реализован
-полностью, backends — локальный каталог и S3-совместимое хранилище.
+First public release. The Terraform module protocol (registry protocol v1) is implemented in
+full, backends are a local directory and an S3-compatible storage.
 
 ### Added
 
 - `GET /.well-known/terraform.json`, `/v1/modules/.../versions`,
-  `/v1/modules/.../<version>/download`, `/archive/...zip` — клиент `terraform init`
-  работает через прокси без изменений.
-- Кэш документов по TTL, `stale-while-revalidate`, `stale-on-error`.
-- Фоновая докачка архива с дедупликацией: `204` + `X-Terraform-Get` клиенту сразу.
-- Бэкенды `fs`, `s3`, оба сразу (`fs,s3`): чтение fs → s3, запись в оба, подогрев
-  дискового кэша при попадании в S3.
-- Распределённые lock-файлы в S3 для нескольких инстансов на один бакет, с TTL и
-  перебоем просроченного лока; условный `If-None-Match: *` при `TFP_S3_CONDITIONAL_LOCKS`.
-- Подпись S3 V4 на стандартной библиотеке (`tfproxy/sigv4.py`), проверена по векторам
-  `botocore.auth.SigV4Auth`.
-- `/healthz`, `/metrics` (Prometheus text format), административные
-  `/api/v1/cache`, `/api/v1/prefetch` с токеном `TFP_ADMIN_TOKEN`.
-- CLI `tfproxy serve|prefetch|cache|info`, HTTPS напрямую через `TFP_TLS_CERT`/`TFP_TLS_KEY`.
-- CI (тесты на Python 3.10–3.13, сборка образа, smoke-тест) и публикация multi-arch
-  образа (`linux/amd64`, `linux/arm64`) в GitHub Container Registry по тегу `vX.Y.Z`.
+  `/v1/modules/.../<version>/download`, `/archive/...zip` — `terraform init` keeps working
+  through the proxy unchanged.
+- TTL document cache, `stale-while-revalidate`, `stale-on-error`.
+- Background archive download with deduplication: the client gets `204` + `X-Terraform-Get`
+  right away.
+- The `fs`, `s3` and combined (`fs,s3`) backends: read fs → s3, write to both, warm the disk
+  cache on an S3 hit.
+- Distributed lock files in S3 for several instances on one bucket, with a TTL and take-over of
+  an expired lock; conditional `If-None-Match: *` under `TFP_S3_CONDITIONAL_LOCKS`.
+- An S3 V4 signature on the standard library (`tfproxy/sigv4.py`), verified against
+  `botocore.auth.SigV4Auth` vectors.
+- `/healthz`, `/metrics` (Prometheus text format), the administrative `/api/v1/cache` and
+  `/api/v1/prefetch` guarded by `TFP_ADMIN_TOKEN`.
+- The `tfproxy serve|prefetch|cache|info` CLI, HTTPS directly via `TFP_TLS_CERT`/`TFP_TLS_KEY`.
+- CI (tests on Python 3.10–3.13, image build, smoke test) and multi-arch image publishing
+  (`linux/amd64`, `linux/arm64`) to the GitHub Container Registry on the `vX.Y.Z` tag.
 
 ### Known limitations
 
-- Протокол провайдеров (`/v1/providers/...`) не проксируется.
-- `Range`-запросы архивов не поддерживаются, архив отдаётся целиком.
-- Незавершённые фоновые загрузки не переживают перезапуск процесса.
+- The provider protocol (`/v1/providers/...`) is not proxied.
+- `Range` requests for archives are not supported, an archive is served in full.
+- Unfinished background downloads do not survive a process restart.

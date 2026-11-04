@@ -42,7 +42,8 @@ class UriEncodingTest(unittest.TestCase):
         self.assertEqual(uri_encode("a/b c", encode_slash=True), "a%2Fb%20c")
 
     def test_reserved_and_unicode(self):
-        self.assertEqual(uri_encode("файл+1.zip"), "%D1%84%D0%B0%D0%B9%D0%BB%2B1.zip")
+        self.assertEqual(uri_encode("café+1.zip"), "caf%C3%A9%2B1.zip")
+        self.assertEqual(uri_encode("日本語+1.zip"), "%E6%97%A5%E6%9C%AC%E8%AA%9E%2B1.zip")
 
     def test_canonical_uri_defaults_to_root(self):
         self.assertEqual(canonical_uri(""), "/")

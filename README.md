@@ -6,37 +6,38 @@
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-tf--registry--proxy-2496ED?logo=docker&logoColor=white)](https://github.com/users/kanlas-net/packages/container/package/tf-registry-proxy)
 [![license MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Кеширующий обратный прокси для **модульного реестра Terraform** (registry protocol v1).
-Клиент получает ответ сразу, а архив докачивается в фоне и дальше отдаётся с диска или из S3.
-Хранение — локальный каталог, S3-совместимое хранилище или оба слоя сразу.
+A caching reverse proxy for the **Terraform module registry** (registry protocol v1).
+The client gets its answer right away, while the archive is downloaded in the background
+and afterwards served from disk or from S3.
+Storage is a local directory, an S3-compatible bucket, or both tiers at once.
 
-Только стандартная библиотека Python: ни одной сторонней зависимости в рантайме
-(ни FastAPI, ни boto3 — подпись S3 V4 реализована в `tfproxy/sigv4.py`).
+Standard library Python only: not a single third-party runtime dependency
+(neither FastAPI nor boto3 — the S3 V4 signature is implemented in `tfproxy/sigv4.py`).
 
-## Как это работает
+## How it works
 
 ```
 terraform init
    │  GET /v1/modules/<ns>/<name>/<prov>/versions
-   ├─► прокси ──► registry.terraform.io        (кэш по TTL, stale-while-revalidate)
+   ├─► proxy ──► registry.terraform.io        (TTL cache, stale-while-revalidate)
    │  GET /v1/modules/<ns>/<name>/<prov>/<ver>/download
-   ├─► прокси: 204 + X-Terraform-Get: https://proxy/archive/<ns>/<name>/<prov>/<ver>.zip
-   │            └── задача в фоновую очередь: скачать архив с источника
+   ├─► proxy: 204 + X-Terraform-Get: https://proxy/archive/<ns>/<name>/<prov>/<ver>.zip
+   │            └── a queue job: download the archive from the origin
    │  GET /archive/<ns>/<name>/<prov>/<ver>.zip
-   └─► прокси: байты из fs → S3 → (если нет) синхронная загрузка с источника
+   └─► proxy: bytes from fs → S3 → (if missing) a synchronous download from the origin
 ```
 
-* Список версий и `X-Terraform-Get` кэшируются как документы с TTL.
-* Архив скачивается **один раз**: фоновая задача, дедупликация по ключу, локальный lock
-  на процесс и распределённый lock-файл в S3 между инстансами.
-* Источник не `http(s)` (например `git::https://…`) прокси честно пробрасывает как есть —
-  такой архив закешировать нельзя.
+* The version list and `X-Terraform-Get` are cached as documents with a TTL.
+* An archive is downloaded **once**: a background job, deduplicated by key, with a local
+  per-process lock and a distributed lock file in S3 shared between instances.
+* A non-`http(s)` origin (for example `git::https://…`) is forwarded as it is — such an
+  archive cannot be cached.
 
-## Быстрый старт
+## Quick start
 
 ### Docker
 
-Готовый образ лежит в GitHub Container Registry, он публичный — логин не нужен:
+The prebuilt image lives in the GitHub Container Registry and is public — no login needed:
 
 ```bash
 docker run -d --name tfproxy -p 8080:8080 \
@@ -46,10 +47,10 @@ docker run -d --name tfproxy -p 8080:8080 \
 curl -s localhost:8080/healthz
 ```
 
-Теги одного и того же образа: `1.0.0` (точная версия), `1.0` (минор), `1` (мажор),
-`latest`. Собраны `linux/amd64` и `linux/arm64`.
+Tags of the same image: `1.0.0` (exact version), `1.0` (minor), `1` (major),
+`latest`. Built for `linux/amd64` and `linux/arm64`.
 
-Собрать из исходников:
+Build from source:
 
 ```bash
 docker build -t tf-registry-proxy .
@@ -60,24 +61,24 @@ docker run -d --name tfproxy -p 8080:8080 \
 curl -s localhost:8080/healthz
 ```
 
-Тесты можно выполнить и внутри образа:
+The tests can also be run inside the image:
 
 ```bash
 docker build --target test -t tfproxy-test . && docker run --rm tfproxy-test
 ```
 
-### Без Docker
+### Without Docker
 
 ```bash
 python3 -m tfproxy serve --port 8080 --backend fs --cache-dir .tf-cache
-python3 -m tfproxy prefetch hashicorp/consul/aws          # прогреть кэш
-python3 -m tfproxy cache --list                            # что лежит в кэше
-python3 -m tfproxy info                                    # итоговая конфигурация
+python3 -m tfproxy prefetch hashicorp/consul/aws          # warm the cache
+python3 -m tfproxy cache --list                            # what the cache holds
+python3 -m tfproxy info                                    # the resulting configuration
 ```
 
-### Конфиг клиента Terraform
+### Terraform client configuration
 
-См. `examples/terraform-cli-config.tf` (переменная `TF_CLI_CONFIG_FILE`):
+See `examples/terraform-cli-config.tf` (the `TF_CLI_CONFIG_FILE` variable):
 
 ```hcl
 host "registry.terraform.io" {
@@ -87,156 +88,159 @@ host "registry.terraform.io" {
 }
 ```
 
-После этого `source = "hashicorp/consul/aws"` работает как раньше, но весь трафик идёт
-через прокси. Второй вариант — использовать имя прокси прямо в источнике
-(`tf.example.com/hashicorp/consul/aws`): тогда `services` не нужен, прокси сам отдаёт
-`/.well-known/terraform.json`.
+After that `source = "hashicorp/consul/aws"` keeps working as before, but all the traffic
+goes through the proxy. The second option is to use the proxy name directly in the source
+(`tf.example.com/hashicorp/consul/aws`): then `services` is not needed, the proxy serves
+`/.well-known/terraform.json` itself.
 
-## Конфигурация
+## Configuration
 
-Все опции доступны и как переменные окружения (`TFP_*`), и как флаги CLI (`tfproxy serve --help`).
+Every option is available both as an environment variable (`TFP_*`) and as a CLI flag
+(`tfproxy serve --help`).
 
-| Переменная | По умолчанию | Назначение |
+| Variable | Default | Purpose |
 |---|---|---|
-| `TFP_HOST` / `TFP_PORT` | `0.0.0.0` / `8080` | адрес слушателя |
-| `TFP_UPSTREAM_URL` | `https://registry.terraform.io` | вышестоящий реестр |
-| `TFP_EXTERNAL_URL` | из заголовка `Host` | базовый URL прокси для `X-Terraform-Get` |
-| `TFP_BACKENDS` | `fs` | `fs`, `s3` или `fs,s3` (чтение: fs → s3, запись: оба) |
-| `TFP_CACHE_DIR` | `./cache` | каталог дискового бэкенда |
-| `TFP_TTL_VERSIONS` | `3600` | TTL списка версий, сек |
-| `TFP_TTL_DOWNLOAD` | `604800` | TTL `X-Terraform-Get`, сек |
-| `TFP_STALE_REVALIDATE` | `true` | отдавать устаревший кэш и обновлять его в фоне |
-| `TFP_PREFETCH_LATEST` | `true` | при запросе версий сразу качать архив последней версии |
-| `TFP_MAX_ARCHIVE_MB` | `512` | жёсткий предел размера архива |
-| `TFP_WORKERS` / `TFP_QUEUE_MAX` | `4` / `2000` | фоновые загрузчики |
-| `TFP_REQUEST_TIMEOUT` | `10` | таймаут сокета для коротких JSON-запросов к реестру, сек |
-| `TFP_DOWNLOAD_TIMEOUT` | `60` | таймаут сокета при качании архива (на один read, не на всю загрузку), сек |
-| `TFP_PROMOTE_TO_FS` | `true` | при попадании в S3 подогревать дисковый кэш |
-| `TFP_LOCKS` | `true` | распределённые lock-файлы |
-| `TFP_LOCK_TTL` | `900` | время жизни lock-файла, сек |
-| `TFP_LOCK_WAIT` | `120` | сколько ждать чужой загрузки, сек |
-| `TFP_S3_BUCKET` / `TFP_S3_REGION` | — | бакет и регион |
-| `TFP_S3_ENDPOINT` | AWS | endpoint для MinIO / Yandex Object Storage / R2 / Ceph |
-| `TFP_S3_PREFIX` | `tfregistry` | префикс ключей |
-| `TFP_S3_ACCESS_KEY` / `TFP_S3_SECRET_KEY` / `TFP_S3_SESSION_TOKEN` | — | ключи (есть фолбэк на `AWS_*`) |
-| `TFP_S3_PATH_STYLE` | авто для своих endpoint | `https://host/bucket/key` вместо виртуального хоста |
-| `TFP_S3_CONDITIONAL_LOCKS` | `false` | создавать локи через `If-None-Match: *` |
-| `TFP_S3_LOCK_VERIFY_MS` | `250` | пауза перед проверкой lock-объекта, если условных записей нет |
-| `TFP_S3_UNSIGNED_PAYLOAD` | `false` | `UNSIGNED-PAYLOAD` при PUT (только HTTPS) |
-| `TFP_ADMIN_TOKEN` | пусто | токен для `/api/v1/*` |
-| `TFP_TLS_CERT` / `TFP_TLS_KEY` | пусто | HTTPS без реверс-прокси |
-| `TFP_LOG_LEVEL` | `INFO` | логирование |
+| `TFP_HOST` / `TFP_PORT` | `0.0.0.0` / `8080` | listen address |
+| `TFP_UPSTREAM_URL` | `https://registry.terraform.io` | the upstream registry |
+| `TFP_EXTERNAL_URL` | from the `Host` header | base URL of the proxy, used in `X-Terraform-Get` |
+| `TFP_BACKENDS` | `fs` | `fs`, `s3` or `fs,s3` (read: fs → s3, write: both) |
+| `TFP_CACHE_DIR` | `./cache` | directory of the disk backend |
+| `TFP_TTL_VERSIONS` | `3600` | TTL of the version list, seconds |
+| `TFP_TTL_DOWNLOAD` | `604800` | TTL of `X-Terraform-Get`, seconds |
+| `TFP_STALE_REVALIDATE` | `true` | serve stale cache and refresh it in the background |
+| `TFP_PREFETCH_LATEST` | `true` | on a version request, immediately queue the latest archive |
+| `TFP_MAX_ARCHIVE_MB` | `512` | hard archive size limit |
+| `TFP_WORKERS` / `TFP_QUEUE_MAX` | `4` / `2000` | background downloaders |
+| `TFP_REQUEST_TIMEOUT` | `10` | socket timeout for short JSON requests to the registry, seconds |
+| `TFP_DOWNLOAD_TIMEOUT` | `60` | socket timeout while downloading an archive (per read, not for the whole download), seconds |
+| `TFP_PROMOTE_TO_FS` | `true` | on an S3 hit, warm the disk cache |
+| `TFP_LOCKS` | `true` | distributed lock files |
+| `TFP_LOCK_TTL` | `900` | lock file lifetime, seconds |
+| `TFP_LOCK_WAIT` | `120` | how long to wait for someone else's download, seconds |
+| `TFP_S3_BUCKET` / `TFP_S3_REGION` | — | bucket and region |
+| `TFP_S3_ENDPOINT` | AWS | endpoint for MinIO / Yandex Object Storage / R2 / Ceph |
+| `TFP_S3_PREFIX` | `tfregistry` | key prefix |
+| `TFP_S3_ACCESS_KEY` / `TFP_S3_SECRET_KEY` / `TFP_S3_SESSION_TOKEN` | — | keys (there is a fallback to `AWS_*`) |
+| `TFP_S3_PATH_STYLE` | auto for custom endpoints | `https://host/bucket/key` instead of a virtual host |
+| `TFP_S3_CONDITIONAL_LOCKS` | `false` | create locks with `If-None-Match: *` |
+| `TFP_S3_LOCK_VERIFY_MS` | `250` | pause before reading a lock object back, when conditional writes are unsupported |
+| `TFP_S3_UNSIGNED_PAYLOAD` | `false` | `UNSIGNED-PAYLOAD` on PUT (HTTPS only) |
+| `TFP_ADMIN_TOKEN` | empty | token for `/api/v1/*` |
+| `TFP_TLS_CERT` / `TFP_TLS_KEY` | empty | HTTPS without a reverse proxy |
+| `TFP_LOG_LEVEL` | `INFO` | logging |
 
-## S3 и несколько инстансов на один бакет
+## S3 and several instances on one bucket
 
-Локи нужны ровно для этого сценария. Перед загрузкой архива инстанс атомарно создаёт
-объект `locks/modules/<ns>/<name>/<prov>/<ver>.zip.lock` с JSON-записью:
+Locks exist for exactly this scenario. Before downloading an archive, an instance atomically
+creates the object `locks/modules/<ns>/<name>/<prov>/<ver>.zip.lock` with a JSON record:
 
 ```json
 {"token": "…", "key": "modules/…/1.0.0.zip", "instance": "host:pid",
  "started_at": 1793780000.0, "expires_at": 1793780900.0}
 ```
 
-* создал лок — качаем; не создал — ждём (`TFP_LOCK_WAIT`), пока объект появится;
-* `expires_at` просрочен → лок считается мусором от убитого процесса и перебивается
-  (`TFP_LOCK_TTL`), поэтому `kill -9` или OOM не блокируют модуль навсегда;
-* длинная загрузка обновляет `expires_at` перед записью объекта;
-* удалить можно только свой лок (сверка `token`), чужой не трогается;
-* после записи (или ошибки) лок снимается в `finally`.
+* created the lock — we download; did not create it — we wait (`TFP_LOCK_WAIT`) until the
+  object shows up;
+* `expires_at` is in the past → the lock counts as leftovers from a killed process and gets
+  taken over (`TFP_LOCK_TTL`), so `kill -9` or an OOM never blocks a module forever;
+* a long download refreshes `expires_at` before writing the object;
+* only your own lock can be deleted (the `token` is compared), someone else's is left alone;
+* after the write (or an error) the lock is released in `finally`.
 
-Два способа атомарного создания:
+Two ways to create a lock atomically:
 
-1. `TFP_S3_CONDITIONAL_LOCKS=true` — PUT с `If-None-Match: *`, хранилище само отказывает
-   (AWS S3, MinIO, R2, Ceph RGW). Строгая взаимная блокировка.
-2. По умолчанию — PUT, короткая пауза и повторное чтение: лок остаётся нашим, только если
-   в бакете лежат ровно наши байты. Работает на любом S3-совместимом хранилище; при
-   редкой гонке возможны два «победителя», но оба скачивают одинаковые байты, а TTL
-   ограничивает последствия.
+1. `TFP_S3_CONDITIONAL_LOCKS=true` — a PUT with `If-None-Match: *`, the storage refuses by
+   itself (AWS S3, MinIO, R2, Ceph RGW). Strict mutual exclusion.
+2. By default — a PUT, a short pause and a read-back: the lock stays ours only if exactly our
+   bytes are in the bucket. Works against any S3-compatible storage; in a rare race there can
+   be two "winners", but both download the same bytes and the TTL bounds the consequences.
 
-Для дискового бэкенда лок создаётся через `O_CREAT|O_EXCL` (атомарно), но диск локален для
-каждого инстанса, поэтому арбитром всегда выступает S3-слой.
+For the disk backend the lock is created with `O_CREAT|O_EXCL` (atomic), but the disk is local
+to each instance, so the S3 tier is always the arbiter.
 
 ## Endpoints
 
-| Метод | Путь | Кто | Описание |
+| Method | Path | Access | Description |
 |---|---|---|---|
-| GET | `/.well-known/terraform.json` | все | `{"modules.v1": "/v1/modules/"}` |
-| GET | `/v1/modules/{ns}/{name}/{prov}/versions` | все | список версий (кэш) |
-| GET | `/v1/modules/{ns}/{name}/{prov}/{ver}/download` | все | `204` + `X-Terraform-Get` |
-| GET/HEAD | `/archive/{ns}/{name}/{prov}/{ver}.zip` | все | байты архива |
-| GET | `/healthz` | все | статус, бэкенды, очередь, статистика локов |
-| GET | `/metrics` | все | Prometheus text format |
-| GET | `/api/v1/cache` | admin | что закэшировано + счётчики |
-| POST | `/api/v1/prefetch` | admin | прогреть: `{"namespace","name","provider","versions"}` |
-| DELETE | `/api/v1/cache/{ns}/{name}/{prov}[/{ver}]` | admin | вычистить модуль или версию |
+| GET | `/.well-known/terraform.json` | anyone | `{"modules.v1": "/v1/modules/"}` |
+| GET | `/v1/modules/{ns}/{name}/{prov}/versions` | anyone | the version list (cached) |
+| GET | `/v1/modules/{ns}/{name}/{prov}/{ver}/download` | anyone | `204` + `X-Terraform-Get` |
+| GET/HEAD | `/archive/{ns}/{name}/{prov}/{ver}.zip` | anyone | the archive bytes |
+| GET | `/healthz` | anyone | status, backends, queue, lock statistics |
+| GET | `/metrics` | anyone | Prometheus text format |
+| GET | `/api/v1/cache` | admin | what is cached + counters |
+| POST | `/api/v1/prefetch` | admin | warm the cache: `{"namespace","name","provider","versions"}` |
+| DELETE | `/api/v1/cache/{ns}/{name}/{prov}[/{ver}]` | admin | drop a module or a version |
 
-Заголовки ответов: `X-TFP-Cache: hit|miss|stale|stale-on-error`, `X-TFP-Source: proxy|upstream`,
-`ETag` (sha256 архива), `Retry-After: 5` при `503 download_in_progress`.
+Response headers: `X-TFP-Cache: hit|miss|stale|stale-on-error`, `X-TFP-Source: proxy|upstream`,
+`ETag` (the sha256 of the archive), `Retry-After: 5` on `503 download_in_progress`.
 
-## Тесты
+## Tests
 
 ```bash
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Поднятые в тестах фейки — это настоящие HTTP-серверы: `tests/support/fake_upstream.py`
-(реестр + раздача архивов) и `tests/support/fake_s3.py` (PUT/GET/HEAD/DELETE/ListObjectsV2,
-проверяет `Authorization`, `x-amz-content-sha256` и `If-None-Match`).
+The fakes the tests bring up are real HTTP servers: `tests/support/fake_upstream.py`
+(a registry plus archive serving) and `tests/support/fake_s3.py` (PUT/GET/HEAD/DELETE/
+ListObjectsV2, checks `Authorization`, `x-amz-content-sha256` and `If-None-Match`).
 
-Что проверяется отдельно от остального:
+Checked separately from the rest:
 
-* `test_sigv4.py` — подпись S3 V4 по эталонным векторам, посчитанным `botocore.auth.SigV4Auth`
-  (при установленном botocore добавляется пофайловое сравнение с botocore);
-* `test_locking.py` — два `LockManager` на одно хранилище: ровно один победитель, перебой
-  просроченного лока, `refresh`, `wait_for_release`;
-* `test_server_registry.py::SharedS3Test` — два инстанса прокси на один бакет: архив
-  скачивается один раз, второй инстанс отдаёт его из S3, параллельная загрузка блокируется;
-* `test_cache.py` — TTL, stale-while-revalidate, `stale-on-error`, дедупликация фоновых задач.
+* `test_sigv4.py` — the S3 V4 signature against reference vectors computed by
+  `botocore.auth.SigV4Auth` (with botocore installed, a per-file comparison against botocore
+  is added);
+* `test_locking.py` — two `LockManager` instances on one storage: exactly one winner, taking
+  over an expired lock, `refresh`, `wait_for_release`;
+* `test_server_registry.py::SharedS3Test` — two proxy instances on one bucket: the archive is
+  downloaded once, the second instance serves it from S3, a parallel download is blocked;
+* `test_cache.py` — TTL, stale-while-revalidate, `stale-on-error`, deduplication of background
+  jobs.
 
-## Версионирование и сборка
+## Versioning and builds
 
-Версия живёт в двух местах и обязана совпадать: `tfproxy.__version__` и `version`
-в `pyproject.toml` (за этим следит `tests/test_packaging.py`).
+The version lives in two places and must match: `tfproxy.__version__` and `version` in
+`pyproject.toml` (`tests/test_packaging.py` makes sure of that).
 
-Релиз — это git-тег `vX.Y.Z`. Пустить новый релиз:
+A release is a git tag `vX.Y.Z`. To ship one:
 
 ```bash
-# 1. поднять версию в tfproxy/__init__.py и pyproject.toml
+# 1. bump the version in tfproxy/__init__.py and pyproject.toml
 git commit -am "release 1.1.0"
 git tag v1.1.0
 git push origin main --follow-tags
 ```
 
-Дальше всё делает GitHub Actions:
+GitHub Actions does the rest:
 
-| Workflow | Когда | Что делает |
+| Workflow | When | What it does |
 |---|---|---|
-| `ci.yml` | push в `main`, PR, ручной запуск | тесты на Python 3.10–3.13, сборка образа, сборка `--target test` и прогон suites внутри образа, smoke-тест `/healthz` и `/.well-known/terraform.json` |
-| `release.yml` | тег `vX.Y.Z` | сверяет тег с `tfproxy.__version__`, прогоняет тесты, собирает `linux/amd64` + `linux/arm64`, публикует в `ghcr.io`, создаёт GitHub Release |
+| `ci.yml` | push to `main`, PR, manual run | tests on Python 3.10–3.13, image build, `--target test` build with the suite run inside the image, smoke test of `/healthz` and `/.well-known/terraform.json` |
+| `release.yml` | tag `vX.Y.Z` | compares the tag with `tfproxy.__version__`, runs the tests, builds `linux/amd64` + `linux/arm64`, publishes to `ghcr.io`, creates the GitHub Release |
 
-Публикация идёт под служебным `GITHUB_TOKEN` (права `packages: write`), отдельных
-секретов в репозитории нет. Видимость пакета наследуется от репозитория — у публичного
-репозитория образ публичный и тянется без `docker login`.
+Publishing runs under the service `GITHUB_TOKEN` (with `packages: write`); the repository needs
+no extra secrets. Package visibility follows the repository — for a public repository the image
+is public and is pulled without `docker login`.
 
-Семавер по-нашему:
+Semver as used here:
 
-* **MAJOR** — ломает клиента или конфиг: другой путь протокола, переименованная или
-  изменившая смысл переменная `TFP_*`, другой формат ключей в бакете;
-* **MINOR** — обратимо совместимое: новый endpoint, новая переменная, новый бэкенд;
-* **PATCH** — только исправления, поведения для клиента меньше не стало.
+* **MAJOR** — breaks the client or the configuration: a different protocol path, a `TFP_*` variable that was renamed or
+  changed meaning, a different key format in the bucket;
+* **MINOR** — backwards compatible: a new endpoint, a new variable, a new backend;
+* **PATCH** — fixes only, nothing got worse for the client.
 
-Образ в реестре: `ghcr.io/kanlas-net/tf-registry-proxy`.
+The image in the registry: `ghcr.io/kanlas-net/tf-registry-proxy`.
 
-## Ограничения
+## Limitations
 
-* Протокол **модулей**. Провайдеры (`/v1/providers/...`, `SHA256SUMS`, подпись ключами) не
-  проксируются — для них есть `getproviders`-зеркала.
-* Terraform требует HTTPS для внешних хостов; для продакшена поставьте TLS
-  (`TFP_TLS_CERT`/`TFP_TLS_KEY` или реверс-прокси). `http://` удобно только для локальных
-  экспериментов на `127.0.0.1`.
-* Диапазонные (`Range`) запросы архивов не поддерживаются: архив всегда отдаётся целиком,
-  размер известен заранее.
-* Кэш метаданных и архивы — обычные объекты: при желании их можно забирать напрямую из
-  бакета, но путь `meta/…` и `locks/…` лучше держать внутри прокси.
-* Фоновая загрузка не переживает перезапуск процесса: незавершённые задачи встанут в очередь
-  заново при следующем запросе клиента.
+* The **module** protocol only. Providers (`/v1/providers/...`, `SHA256SUMS`, key signatures)
+  are not proxied — `getproviders` mirrors exist for those.
+* Terraform requires HTTPS for external hosts; for production add TLS
+  (`TFP_TLS_CERT`/`TFP_TLS_KEY` or a reverse proxy). `http://` is convenient only for local
+  experiments on `127.0.0.1`.
+* Range requests for archives are not supported: an archive is always served in full, its size
+  is known in advance.
+* Metadata cache entries and archives are plain objects: if you want, you can read them straight
+  from the bucket, but keep the `meta/…` and `locks/…` paths inside the proxy.
+* Background downloads do not survive a process restart: unfinished jobs are queued again on the
+  next client request.
