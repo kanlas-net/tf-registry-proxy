@@ -1,5 +1,11 @@
 # tf-registry-proxy
 
+[![CI](https://github.com/kanlas-net/tf-registry-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/kanlas-net/tf-registry-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/kanlas-net/tf-registry-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/kanlas-net/tf-registry-proxy/actions/workflows/release.yml)
+[![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/kanlas-net/tf-registry-proxy/releases/tag/v1.0.0)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-tf--registry--proxy-2496ED?logo=docker&logoColor=white)](https://github.com/users/kanlas-net/packages/container/package/tf-registry-proxy)
+[![license MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Кеширующий обратный прокси для **модульного реестра Terraform** (registry protocol v1).
 Клиент получает ответ сразу, а архив докачивается в фоне и дальше отдаётся с диска или из S3.
 Хранение — локальный каталог, S3-совместимое хранилище или оба слоя сразу.
@@ -29,6 +35,21 @@ terraform init
 ## Быстрый старт
 
 ### Docker
+
+Готовый образ лежит в GitHub Container Registry, он публичный — логин не нужен:
+
+```bash
+docker run -d --name tfproxy -p 8080:8080 \
+  -e TFP_BACKENDS=fs \
+  -v tfproxy-cache:/var/cache/tf-registry-proxy \
+  ghcr.io/kanlas-net/tf-registry-proxy:1.0.0
+curl -s localhost:8080/healthz
+```
+
+Теги одного и того же образа: `1.0.0` (точная версия), `1.0` (минор), `1` (мажор),
+`latest`. Собраны `linux/amd64` и `linux/arm64`.
+
+Собрать из исходников:
 
 ```bash
 docker build -t tf-registry-proxy .
@@ -171,6 +192,40 @@ python3 -m unittest discover -s tests -t . -v
 * `test_server_registry.py::SharedS3Test` — два инстанса прокси на один бакет: архив
   скачивается один раз, второй инстанс отдаёт его из S3, параллельная загрузка блокируется;
 * `test_cache.py` — TTL, stale-while-revalidate, `stale-on-error`, дедупликация фоновых задач.
+
+## Версионирование и сборка
+
+Версия живёт в двух местах и обязана совпадать: `tfproxy.__version__` и `version`
+в `pyproject.toml` (за этим следит `tests/test_packaging.py`).
+
+Релиз — это git-тег `vX.Y.Z`. Пустить новый релиз:
+
+```bash
+# 1. поднять версию в tfproxy/__init__.py и pyproject.toml
+git commit -am "release 1.1.0"
+git tag v1.1.0
+git push origin main --follow-tags
+```
+
+Дальше всё делает GitHub Actions:
+
+| Workflow | Когда | Что делает |
+|---|---|---|
+| `ci.yml` | push в `main`, PR, ручной запуск | тесты на Python 3.10–3.13, сборка образа, сборка `--target test` и прогон suites внутри образа, smoke-тест `/healthz` и `/.well-known/terraform.json` |
+| `release.yml` | тег `vX.Y.Z` | сверяет тег с `tfproxy.__version__`, прогоняет тесты, собирает `linux/amd64` + `linux/arm64`, публикует в `ghcr.io`, создаёт GitHub Release |
+
+Публикация идёт под служебным `GITHUB_TOKEN` (права `packages: write`), отдельных
+секретов в репозитории нет. Видимость пакета наследуется от репозитория — у публичного
+репозитория образ публичный и тянется без `docker login`.
+
+Семавер по-нашему:
+
+* **MAJOR** — ломает клиента или конфиг: другой путь протокола, переименованная или
+  изменившая смысл переменная `TFP_*`, другой формат ключей в бакете;
+* **MINOR** — обратимо совместимое: новый endpoint, новая переменная, новый бэкенд;
+* **PATCH** — только исправления, поведения для клиента меньше не стало.
+
+Образ в реестре: `ghcr.io/kanlas-net/tf-registry-proxy`.
 
 ## Ограничения
 

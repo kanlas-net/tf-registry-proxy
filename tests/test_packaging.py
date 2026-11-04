@@ -47,6 +47,22 @@ class DockerfileTest(unittest.TestCase):
     def test_dockerignore_excludes_the_host_cache(self):
         self.assertIn("cache/", read(".dockerignore"))
 
+    def test_dockerignore_keeps_everything_the_suite_needs(self):
+        """The ``test`` stage does ``COPY .`` and runs the suite, so its inputs must be
+        in the build context: excluding ``tests/`` or ``*.md`` breaks ``--target test``.
+        """
+        patterns = {
+            line.strip()
+            for line in read(".dockerignore").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        needed = ("LICENSE", "README.md", "CHANGELOG.md", "pyproject.toml", "docker-compose.yml", "examples", "tests", "tfproxy")
+        for name in needed:
+            with self.subTest(path=name):
+                self.assertNotIn(name, patterns, f"{name} must stay in the build context")
+                self.assertNotIn(name + "/", patterns, f"{name}/ must stay in the build context")
+        self.assertNotIn("*.md", patterns, "*.md hides README.md and CHANGELOG.md")
+
 
 class ComposeTest(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
@@ -100,6 +116,49 @@ class ProjectMetadataTest(unittest.TestCase):
                     if module not in allowed and not module.startswith("tfproxy"):
                         offenders.add(f"{os.path.relpath(path, ROOT)}: {module}")
         self.assertEqual(offenders, set(), "the runtime must stay standard-library only")
+
+
+class ReleaseEngineeringTest(unittest.TestCase):
+    """The GitHub workflows that version and publish the image stay honest."""
+
+    def workflow(self, name: str) -> str:
+        path = os.path.join(ROOT, ".github", "workflows", name)
+        if not os.path.exists(path):
+            # ``--target test`` builds from a context without .github (see .dockerignore).
+            self.skipTest(f"{name} is not in the build context")
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_version_is_a_plain_semver(self):
+        self.assertRegex(tfproxy.__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_license_is_shipped(self):
+        self.assertIn("MIT License", read("LICENSE"))
+
+    def test_changelog_has_an_entry_for_the_current_version(self):
+        self.assertIn(f"## [{tfproxy.__version__}]", read("CHANGELOG.md"))
+
+    def test_ci_builds_and_smoke_tests_the_image(self):
+        text = self.workflow("ci.yml")
+        self.assertIn("unittest discover", text)
+        self.assertIn("docker/build-push-action", text)
+        self.assertIn("/healthz", text)
+        self.assertNotIn("packages: write", text, "CI must not publish anything")
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_release_publishes_to_ghcr_under_a_version_tag(self):
+        import yaml
+
+        document = yaml.safe_load(self.workflow("release.yml"))
+        self.assertEqual(document["permissions"]["packages"], "write")
+        # PyYAML resolves the bare key ``on`` as the boolean True.
+        triggers = document["on"] if "on" in document else document[True]
+        self.assertIn("v[0-9]+.[0-9]+.[0-9]+*", triggers["push"]["tags"])
+        text = self.workflow("release.yml")
+        self.assertIn("ghcr.io", text)
+        self.assertIn("tfproxy.__version__", text, "the tag must be checked against the package version")
+        self.assertIn("type=semver,pattern={{version}}", text)
+        self.assertIn("type=raw,value=latest", text)
 
 
 class ReadmeTest(unittest.TestCase):

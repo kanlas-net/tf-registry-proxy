@@ -1,5 +1,8 @@
+# The runtime stage copies only tfproxy/, so nothing here bloats the published image.
+# What stays out is chosen by size and by the `test` stage: that stage does COPY . /src
+# and runs the whole suite, so everything the suite reads (README.md, pyproject.toml,
+# docker-compose.yml, tests/) must stay in the build context.
 .git
-.gitignore
 .github
 __pycache__
 *.pyc
@@ -7,8 +10,4 @@ __pycache__
 .pytest_cache
 .ruff_cache
 cache/
-tests/
 docs/
-*.md
-docker-compose.yml
-pyproject.toml
