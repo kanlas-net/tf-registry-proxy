@@ -58,6 +58,10 @@ ran it.
    `test_release_tag_filter_actually_matches_the_version_tag`.
 9. **The repository is English-only** — code, comments, docs and test data. Do not add text in
    another language.
+10. **A re-pushed tag must publish the release again.** Deleting a tag turns its release into a
+   draft instead of deleting it, and `gh release view` still finds drafts, so a step that only
+   checks existence skips publishing forever. Guarded by
+   `test_a_leftover_draft_release_is_published_not_skipped`.
 
 ## Layout
 
@@ -121,6 +125,8 @@ git push origin main --follow-tags
   Pushing a new `release.yml` and its tag in the same `git push` silently publishes nothing.
   If you change a workflow, push the branch first, then tag.
 - The tag must equal `tfproxy.__version__`, or the `verify` job fails before anything is pushed.
+- **Re-tagging a version is allowed.** Delete the tag, push the new one; the release job publishes
+  the draft the old tag left behind. Check the release page afterwards — a draft is invisible there.
 - Semver as used here: **MAJOR** breaks the client or the config (protocol path, renamed or
   re-purposed `TFP_*` variable, bucket key format); **MINOR** is backwards compatible (endpoint,
   variable, backend); **PATCH** is fixes only.

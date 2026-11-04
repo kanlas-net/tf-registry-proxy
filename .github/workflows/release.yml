@@ -110,7 +110,15 @@ jobs:
           set -e
           VERSION=${GITHUB_REF_NAME#v}
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists"
+            # Deleting a tag does not delete its release: GitHub keeps it as a draft, and
+            # gh release view still finds drafts. A draft stays invisible on the release
+            # page, so a leftover draft has to be published instead of skipped.
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true" ]; then
+              echo "release $GITHUB_REF_NAME is a draft, publishing it"
+              gh release edit "$GITHUB_REF_NAME" --draft=false
+            else
+              echo "release $GITHUB_REF_NAME is already published"
+            fi
           else
             gh release create "$GITHUB_REF_NAME" \
               --title "$GITHUB_REF_NAME" \

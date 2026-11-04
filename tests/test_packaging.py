@@ -216,6 +216,25 @@ class ReleaseEngineeringTest(unittest.TestCase):
                 )
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_a_leftover_draft_release_is_published_not_skipped(self):
+        """Deleting a tag turns its release into a draft, it does not delete it.
+
+        Re-tagging a version left v1.0.0 as an unpublished draft: the step only asked
+        whether the release existed, ``gh release view`` answers yes for a draft, and the
+        step printed "already exists" while the release page stayed empty.
+        """
+        import yaml
+
+        document = yaml.safe_load(self.workflow("release.yml"))
+        steps = document["jobs"]["release-notes"]["steps"]
+        script = "\n".join(str(step.get("run", "")) for step in steps)
+        self.assertIn("isDraft", script, "the step must look at whether the release is a draft")
+        self.assertRegex(script, r"gh\s+release\s+edit[^\n]*--draft=false", "a draft must be published")
+        # The publish has to happen on the "release exists" path, not instead of it.
+        self.assertLess(script.index("gh release view"), script.index("--draft=false"))
+        self.assertIn("gh release create", script, "a release that does not exist yet must be created")
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
     def test_release_tag_filter_actually_matches_the_version_tag(self):
         """A tag filter that never matches silently publishes nothing.
 

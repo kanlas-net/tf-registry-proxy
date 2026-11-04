@@ -4,6 +4,15 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), the vers
 [SemVer](https://semver.org/). A release is marked by a git tag `vX.Y.Z`, which is also what
 publishes the image to `ghcr.io`.
 
+## [Unreleased]
+
+### Fixed
+
+- Re-tagging a version no longer leaves the release unpublished. Deleting a tag turns its release
+  into a draft instead of deleting it, and the release job skipped every release it could still
+  see — including that invisible draft. The job now publishes a leftover draft with
+  `gh release edit --draft=false`.
+
 ## [1.0.0] - 2026-11-04
 
 First public release. The Terraform module protocol (registry protocol v1) is implemented in
