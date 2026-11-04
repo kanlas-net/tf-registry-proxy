@@ -1,0 +1,40 @@
+# Two instances of the proxy sharing one S3 bucket — the setup the download locks
+# exist for. Copy, fill in the credentials, then: docker compose up -d --build
+services:
+  tfproxy-a:
+    build: .
+    image: tf-registry-proxy:local
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TFP_UPSTREAM_URL: https://registry.terraform.io
+      TFP_BACKENDS: fs,s3
+      TFP_CACHE_DIR: /var/cache/tf-registry-proxy
+      TFP_EXTERNAL_URL: https://tf.example.com
+      TFP_TTL_VERSIONS: "3600"
+      TFP_LOCK_TTL: "900"
+      TFP_LOCK_WAIT: "120"
+      TFP_S3_BUCKET: ${TFP_S3_BUCKET}
+      TFP_S3_REGION: ${TFP_S3_REGION:-us-east-1}
+      TFP_S3_ENDPOINT: ${TFP_S3_ENDPOINT:-}
+      TFP_S3_PREFIX: tfregistry
+      TFP_S3_ACCESS_KEY: ${TFP_S3_ACCESS_KEY}
+      TFP_S3_SECRET_KEY: ${TFP_S3_SECRET_KEY}
+      # Set to true for AWS/MinIO/R2: uses If-None-Match instead of the write-verify
+      # handshake when creating lock objects.
+      TFP_S3_CONDITIONAL_LOCKS: ${TFP_S3_CONDITIONAL_LOCKS:-false}
+      TFP_ADMIN_TOKEN: ${TFP_ADMIN_TOKEN:-}
+    volumes:
+      - tfproxy-a-cache:/var/cache/tf-registry-proxy
+
+  tfproxy-b:
+    extends: tfproxy-a
+    ports:
+      - "8081:8080"
+    volumes:
+      - tfproxy-b-cache:/var/cache/tf-registry-proxy
+
+volumes:
+  tfproxy-a-cache:
+  tfproxy-b-cache:

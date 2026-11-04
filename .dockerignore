@@ -1,0 +1,14 @@
+.git
+.gitignore
+.github
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+cache/
+tests/
+docs/
+*.md
+docker-compose.yml
+pyproject.toml

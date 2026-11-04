@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tf-registry-proxy"
+version = "0.1.0"
+description = "Caching reverse proxy for the Terraform module registry protocol (filesystem + S3)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Deliberately empty: the runtime uses only the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed for the optional cross-check of the SigV4 implementation.
+dev = ["botocore>=1.31"]
+
+[project.scripts]
+tfproxy = "tfproxy.__main__:main"
+
+[tool.setuptools]
+packages = ["tfproxy", "tfproxy.storage"]
+
+[tool.ruff]
+line-length = 118
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "SIM105", "B904"]
