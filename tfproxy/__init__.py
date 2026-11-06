@@ -4,5 +4,5 @@ The package is dependency-free: it only uses the Python standard library so it c
 in a slim container without a build step.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = ["__version__"]

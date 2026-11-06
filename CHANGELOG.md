@@ -6,6 +6,8 @@ publishes the image to `ghcr.io`.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-06
+
 ### Added
 
 - **Readiness and startup checks.** `GET /readyz` probes every storage backend (a
