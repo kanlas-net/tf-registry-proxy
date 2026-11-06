@@ -31,6 +31,16 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = _env(name)
     if raw is None:
@@ -137,6 +147,29 @@ class Config:
     tls_key: str = ""
     log_level: str = "INFO"
 
+    # ---- health / readiness ------------------------------------------------
+    #: Include a write round trip (put, read back, delete) in the storage probes.
+    health_probe_write: bool = True
+    #: Seconds a readiness result is reused, so kubelet polling does not hammer the bucket.
+    health_cache_ttl: float = 5.0
+    #: Socket timeout used by probes, seconds. Much shorter than a normal object operation.
+    health_timeout: float = 5.0
+    #: Probe the storage backends once before serving traffic.
+    startup_check: bool = True
+    #: How many times to retry the startup probe (a bucket mid-restart gets a chance).
+    startup_check_retries: int = 5
+    startup_check_interval: float = 3.0
+    #: Exit non-zero instead of serving when the startup probe fails.
+    startup_required: bool = False
+    #: False = one healthy backend is enough to be ready (degraded but serving).
+    ready_strict: bool = True
+    #: Let a broken upstream registry decide readiness too.
+    ready_upstream: bool = False
+
+    # ---- metrics -----------------------------------------------------------
+    #: Per-module pending series to export (0 = totals only). Bounds cardinality.
+    metrics_pending_series: int = 50
+
     s3: Optional[S3Config] = None
 
     # ---- derived -----------------------------------------------------------
@@ -172,6 +205,16 @@ class Config:
             raise ConfigError("lock wait must be zero or positive")
         if bool(self.tls_cert) != bool(self.tls_key):
             raise ConfigError("TLS needs both a certificate and a key")
+        if self.health_cache_ttl < 0:
+            raise ConfigError("health cache TTL must be zero or positive")
+        if self.health_timeout <= 0:
+            raise ConfigError("health probe timeout must be positive")
+        if self.startup_check_retries < 1:
+            raise ConfigError("the startup check needs at least one attempt")
+        if self.startup_check_interval < 0:
+            raise ConfigError("the startup check interval must be zero or positive")
+        if self.metrics_pending_series < 0:
+            raise ConfigError("the pending metrics limit cannot be negative")
         return self
 
     def public_base(self, request_host: str = "", scheme: str = "http") -> str:
@@ -245,6 +288,16 @@ class Config:
             tls_cert=_env("TFP_TLS_CERT", "") or "",
             tls_key=_env("TFP_TLS_KEY", "") or "",
             log_level=_env("TFP_LOG_LEVEL", "INFO") or "INFO",
+            health_probe_write=_env_bool("TFP_HEALTH_PROBE_WRITE", True),
+            health_cache_ttl=_env_float("TFP_HEALTH_CACHE_TTL", 5.0),
+            health_timeout=_env_float("TFP_HEALTH_TIMEOUT", 5.0),
+            startup_check=_env_bool("TFP_STARTUP_CHECK", True),
+            startup_check_retries=_env_int("TFP_STARTUP_CHECK_RETRIES", 5),
+            startup_check_interval=_env_float("TFP_STARTUP_CHECK_INTERVAL", 3.0),
+            startup_required=_env_bool("TFP_STARTUP_REQUIRED", False),
+            ready_strict=_env_bool("TFP_READY_STRICT", True),
+            ready_upstream=_env_bool("TFP_READY_UPSTREAM", False),
+            metrics_pending_series=_env_int("TFP_METRICS_PENDING_SERIES", 50),
             s3=s3,
         ).validate()
 
@@ -298,6 +351,26 @@ def add_server_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--s3-secret-key", dest="s3_secret_key", default=None)
     parser.add_argument("--s3-prefix", dest="s3_prefix", default=None)
     parser.add_argument("--s3-path-style", dest="s3_path_style", action="store_true")
+    parser.add_argument("--health-timeout", dest="health_timeout", type=float, default=None,
+                        help="socket timeout for storage probes (TFP_HEALTH_TIMEOUT)")
+    parser.add_argument("--health-cache-ttl", dest="health_cache_ttl", type=float, default=None,
+                        help="seconds a readiness result is reused (TFP_HEALTH_CACHE_TTL)")
+    parser.add_argument("--no-health-probe-write", dest="no_health_probe_write", action="store_true",
+                        help="do not write a probe object when checking storage (TFP_HEALTH_PROBE_WRITE)")
+    parser.add_argument("--no-startup-check", dest="no_startup_check", action="store_true",
+                        help="skip the storage probe at startup (TFP_STARTUP_CHECK)")
+    parser.add_argument("--startup-check-retries", dest="startup_check_retries", type=int, default=None,
+                        help="startup probe attempts (TFP_STARTUP_CHECK_RETRIES)")
+    parser.add_argument("--startup-check-interval", dest="startup_check_interval", type=float, default=None,
+                        help="seconds between startup probe attempts (TFP_STARTUP_CHECK_INTERVAL)")
+    parser.add_argument("--startup-required", dest="startup_required", action="store_true",
+                        help="exit non-zero when the startup probe fails (TFP_STARTUP_REQUIRED)")
+    parser.add_argument("--ready-permissive", dest="ready_permissive", action="store_true",
+                        help="one healthy backend is enough for /readyz (TFP_READY_STRICT)")
+    parser.add_argument("--ready-upstream", dest="ready_upstream", action="store_true",
+                        help="let a broken upstream registry fail /readyz (TFP_READY_UPSTREAM)")
+    parser.add_argument("--metrics-pending-series", dest="metrics_pending_series", type=int, default=None,
+                        help="per-module pending series to export, 0 disables them (TFP_METRICS_PENDING_SERIES)")
 
 
 _SIMPLE_ATTRS = (
@@ -319,6 +392,11 @@ _SIMPLE_ATTRS = (
     "tls_cert",
     "tls_key",
     "log_level",
+    "health_cache_ttl",
+    "health_timeout",
+    "startup_check_retries",
+    "startup_check_interval",
+    "metrics_pending_series",
 )
 
 
@@ -338,6 +416,16 @@ def config_from_namespace(namespace: argparse.Namespace, base: Optional[Config] 
         cfg.prefetch_latest = False
     if getattr(namespace, "no_locks", False):
         cfg.locks_enabled = False
+    if getattr(namespace, "no_health_probe_write", False):
+        cfg.health_probe_write = False
+    if getattr(namespace, "no_startup_check", False):
+        cfg.startup_check = False
+    if getattr(namespace, "startup_required", False):
+        cfg.startup_required = True
+    if getattr(namespace, "ready_permissive", False):
+        cfg.ready_strict = False
+    if getattr(namespace, "ready_upstream", False):
+        cfg.ready_upstream = True
     if "s3" in cfg.backends:
         s3 = cfg.s3 or S3Config(bucket="")
         for dest, attr in (

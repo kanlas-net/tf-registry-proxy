@@ -11,7 +11,7 @@ import time
 from typing import Optional
 
 from ..errors import NotFound, StorageError
-from .base import ObjectMeta, Storage, StreamHandle, hash_file
+from .base import ObjectMeta, ProbeResult, Storage, StreamHandle, hash_file
 
 META_SUFFIX = ".meta.json"
 
@@ -246,6 +246,23 @@ class FilesystemStorage(Storage):
 
     def describe(self) -> dict[str, str]:
         return {"backend": self.name, "root": self.root}
+
+    def probe(self, write: bool = False) -> ProbeResult:
+        """The disk must exist and be writable; a write probe does a real round trip."""
+        started = time.perf_counter()
+        ok, detail = True, self.root
+        try:
+            if not os.path.isdir(self.root):
+                ok, detail = False, f"{self.root} is not a directory"
+            elif not os.access(self.root, os.W_OK | os.X_OK):
+                ok, detail = False, f"{self.root} is not writable"
+            else:
+                os.listdir(self.root)
+        except OSError as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        if ok and write:
+            ok, detail = self.probe_write()
+        return ProbeResult(self.name, ok, detail, write, time.perf_counter() - started)
 
 
 def _sha256_bytes(data: bytes) -> str:

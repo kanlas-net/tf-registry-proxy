@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -93,7 +94,9 @@ class RegistryClient:
         except urllib.error.HTTPError as exc:
             return exc
         except urllib.error.URLError as exc:
-            raise UpstreamError(502, f"upstream registry is unreachable: {exc.reason}") from exc
+            raise UpstreamError(
+                502, f"upstream registry is unreachable: {exc.reason}", reason="unreachable"
+            ) from exc
 
     def request(self, path: str, method: str = "GET") -> UpstreamResponse:
         url = f"{self.base_url}{path}"
@@ -111,29 +114,62 @@ class RegistryClient:
             raise NotFound(f"module {ref.module_id} is not published upstream", "module_not_found")
         if response.status >= 400:
             raise UpstreamError(
-                502, f"upstream answered {response.status} for {ref.module_id} version list"
+                502,
+                f"upstream answered {response.status} for {ref.module_id} version list",
+                reason=f"http_{response.status}",
             )
         try:
             payload = response.json()
         except (ValueError, UnicodeDecodeError) as exc:
-            raise UpstreamError(502, "upstream returned a malformed version list") from exc
+            raise UpstreamError(502, "upstream returned a malformed version list", reason="malformed") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("modules"), list):
-            raise UpstreamError(502, "upstream version list is missing the 'modules' key")
+            raise UpstreamError(
+                502, "upstream version list is missing the 'modules' key", reason="malformed"
+            )
         return response
 
     def download_source(self, ref: ModuleRef) -> UpstreamResponse:
         if not ref.version:
-            raise UpstreamError(500, "version required to resolve a download source")
+            raise UpstreamError(500, "version required to resolve a download source", reason="config")
         path = f"/v1/modules/{ref.namespace}/{ref.name}/{ref.provider}/{ref.version}/download"
         response = self.request(path, method="GET")
         if response.status == 404:
             raise NotFound(f"module {ref.module_id}@{ref.version} is not published upstream", "module_not_found")
         if response.status >= 400:
-            raise UpstreamError(502, f"upstream answered {response.status} for the download source")
+            raise UpstreamError(
+                502,
+                f"upstream answered {response.status} for the download source",
+                reason=f"http_{response.status}",
+            )
         getter = response.headers.get(X_TERRAFORM_GET)
         if not getter:
-            raise UpstreamError(502, f"upstream did not return {X_TERRAFORM_GET} for {ref.module_id}@{ref.version}")
+            raise UpstreamError(
+                502,
+                f"upstream did not return {X_TERRAFORM_GET} for {ref.module_id}@{ref.version}",
+                reason="missing_header",
+            )
         return response
+
+    # ---- health ------------------------------------------------------------
+    def probe(self) -> tuple[bool, str, float]:
+        """Is the registry reachable? ``(ok, detail, seconds)``.
+
+        Any HTTP answer counts as reachable, a 404 included: what the probe has to rule
+        out is DNS, TCP, TLS and certificate trouble, not whether a module exists.
+        """
+        started = time.perf_counter()
+        try:
+            response = self._open(f"{self.base_url}/.well-known/terraform.json")
+        except UpstreamError as exc:
+            return False, str(exc), time.perf_counter() - started
+        try:
+            status = getattr(response, "status", None) or response.getcode()
+        finally:
+            try:
+                response.close()  # type: ignore[union-attr]
+            except Exception:  # pragma: no cover - closing is best effort
+                pass
+        return True, f"registry answered HTTP {status}", time.perf_counter() - started
 
 
 class ArchiveDownloader:
@@ -159,15 +195,15 @@ class ArchiveDownloader:
         if scheme.lower() not in ("http", "https"):
             # Defence in depth: the proxy must never fetch a local or exotic scheme, even
             # if a caller hands it a source that skipped the cacheable check.
-            raise UpstreamError(502, f"refusing to fetch a {scheme or 'schemeless'} URL")
+            raise UpstreamError(502, f"refusing to fetch a {scheme or 'schemeless'} URL", reason="bad_scheme")
         request = urllib.request.Request(url, method="GET")
         request.add_header("User-Agent", self.user_agent)
         try:
             response = self._opener(request, timeout=self.download_timeout)
         except urllib.error.HTTPError as exc:
-            raise UpstreamError(502, f"archive source answered HTTP {exc.code}") from exc
+            raise UpstreamError(502, f"archive source answered HTTP {exc.code}", reason=f"http_{exc.code}") from exc
         except urllib.error.URLError as exc:
-            raise UpstreamError(502, f"archive source is unreachable: {exc.reason}") from exc
+            raise UpstreamError(502, f"archive source is unreachable: {exc.reason}", reason="unreachable") from exc
 
         fd, path = tempfile.mkstemp(prefix="tfp-dl-", dir=self.tmp_dir, suffix=".part")
         digest = hashlib.sha256()
@@ -176,7 +212,7 @@ class ArchiveDownloader:
             with response, os.fdopen(fd, "wb") as out:
                 status = getattr(response, "status", None) or response.getcode()
                 if status >= 400:
-                    raise UpstreamError(502, f"archive source answered HTTP {status}")
+                    raise UpstreamError(502, f"archive source answered HTTP {status}", reason=f"http_{status}")
                 content_type = response.headers.get("Content-Type", "")
                 while True:
                     chunk = response.read(256 * 1024)
@@ -184,14 +220,18 @@ class ArchiveDownloader:
                         break
                     size += len(chunk)
                     if size > self.max_bytes:
-                        raise UpstreamError(502, f"archive exceeds the {self.max_bytes} byte limit")
+                        raise UpstreamError(
+                            502, f"archive exceeds the {self.max_bytes} byte limit", reason="too_large"
+                        )
                     digest.update(chunk)
                     out.write(chunk)
             if size == 0:
-                raise UpstreamError(502, "archive source returned an empty body")
+                raise UpstreamError(502, "archive source returned an empty body", reason="empty")
             sha256 = digest.hexdigest()
             if expected_sha256 and expected_sha256.lower() != sha256:
-                raise UpstreamError(502, "downloaded archive does not match the expected checksum")
+                raise UpstreamError(
+                    502, "downloaded archive does not match the expected checksum", reason="checksum"
+                )
             return DownloadedArchive(path=path, size=size, sha256=sha256, content_type=content_type)
         except BaseException:
             _unlink(path)

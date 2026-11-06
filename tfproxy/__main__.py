@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("--list", action="store_true", help="list cached objects (default)")
     cache.add_argument("--purge", action="store_true", help="drop everything known about MODULE")
     cache.add_argument("module", nargs="?", help="namespace/name/provider[@version]")
+
+    health = sub.add_parser("healthcheck", help="probe the storage backends and exit 0 (ok) or 1 (broken)")
+    add_server_options(health)
+    health.add_argument("--read-only", action="store_true", help="skip the write probe")
+    health.add_argument("--pending", action="store_true", help="also print what is still waiting to be downloaded")
     return parser
 
 
@@ -67,14 +72,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     if command == "serve":
-        serve(config)
-        return 0
+        return serve(config)
 
     app, storage, queue = build_application(config)
     try:
         if command == "info":
             print(json.dumps(safe_config(config), indent=2, sort_keys=True))
             return 0
+        if command == "healthcheck":
+            return cmd_healthcheck(app, args)
         if command == "prefetch":
             return cmd_prefetch(app.cache, args.modules)
         if command == "cache":
@@ -101,6 +107,16 @@ def safe_config(config: Config) -> dict:
         "workers": config.workers,
         "tls": bool(config.tls_cert),
         "admin_token": "set" if config.admin_token else "unset",
+        "health": {
+            "probe_write": config.health_probe_write,
+            "probe_timeout": config.health_timeout,
+            "cache_ttl": config.health_cache_ttl,
+            "startup_check": config.startup_check,
+            "startup_required": config.startup_required,
+            "ready_strict": config.ready_strict,
+            "ready_upstream": config.ready_upstream,
+        },
+        "metrics_pending_series": config.metrics_pending_series,
     }
     if config.s3:
         data["s3"] = {
@@ -112,6 +128,16 @@ def safe_config(config: Config) -> dict:
             "path_style": config.s3.resolved_path_style(),
         }
     return data
+
+
+def cmd_healthcheck(app, args) -> int:
+    """One-shot version of ``/readyz``: usable as an initContainer or a deploy gate."""
+    report = app.health.check(force=True, write=not args.read_only)
+    payload = report.to_dict()
+    if args.pending:
+        payload["pending"] = app.cache.pending.stats()
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if report.ok else 1
 
 
 def cmd_prefetch(cache: CacheService, addresses: list[str]) -> int:

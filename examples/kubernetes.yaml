@@ -1,0 +1,130 @@
+# tf-registry-proxy on Kubernetes.
+#
+#   kubectl apply -f examples/kubernetes.yaml
+#
+# Two instances share one S3 bucket (that is what the download locks are for) and each keeps a
+# local disk cache in its own emptyDir. Drop the s3 backend and the Secret if you only need the
+# disk tier.
+#
+# The probes are the interesting part:
+#   startupProbe   the pod is not ready until the bucket answers (write probe included)
+#   readinessProbe taken out of the Service while the bucket is unreachable
+#   livenessProbe  /healthz only — never point it at /readyz, or an S3 outage restarts every pod
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tfproxy-s3
+  labels:
+    app: tfproxy
+type: Opaque
+stringData:
+  # Replace these; never commit the real values.
+  TFP_S3_ACCESS_KEY: "replace-me"
+  TFP_S3_SECRET_KEY: "replace-me"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tfproxy-config
+  labels:
+    app: tfproxy
+data:
+  TFP_UPSTREAM_URL: "https://registry.terraform.io"
+  TFP_BACKENDS: "fs,s3"
+  TFP_EXTERNAL_URL: "https://tf.example.com"
+  TFP_S3_BUCKET: "tf-registry-cache"
+  TFP_S3_REGION: "us-east-1"
+  TFP_S3_PREFIX: "tfregistry"
+  # TFP_S3_ENDPOINT: "https://storage.example.net"   # only for MinIO / R2 / Ceph / Yandex OS
+  TFP_CACHE_DIR: "/var/cache/tf-registry-proxy"
+  TFP_LOG_LEVEL: "INFO"
+  # A bucket that is briefly unreachable must not stop the process: the pods go NotReady and
+  # keep serving from the disk cache. Set to "true" to make it fatal instead.
+  TFP_STARTUP_REQUIRED: "false"
+  # "false" keeps an instance in rotation when only one tier is healthy.
+  TFP_READY_STRICT: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tfproxy
+  labels:
+    app: tfproxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tfproxy
+  template:
+    metadata:
+      labels:
+        app: tfproxy
+      annotations:
+        # Scrape without a ServiceMonitor; swap for a ServiceMonitor/PodMonitor if you have one.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # The image already switches to a non-root user, and its UID is assigned at build time, so
+      # no securityContext is set here. If your policy demands runAsNonRoot, pin runAsUser to the
+      # UID in the image (docker inspect --format '{{.Config.User}}') and match fsGroup to it.
+      containers:
+        - name: tfproxy
+          image: ghcr.io/kanlas-net/tf-registry-proxy:1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: tfproxy-config
+            - secretRef:
+                name: tfproxy-s3
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/tf-registry-proxy
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tfproxy
+  labels:
+    app: tfproxy
+spec:
+  selector:
+    app: tfproxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

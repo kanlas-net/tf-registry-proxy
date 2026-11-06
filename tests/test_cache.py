@@ -172,7 +172,7 @@ class ArchiveTest(CacheTestCase):
             meta = self.cache.ensure_archive(target, wait=5)
             self.assertIsNotNone(meta)
             self.assertEqual(self.registry.hits["archive"], 0, "the peer fetched it, not us")
-            self.assertEqual(self.cache.metrics()["archive_shared_hit"], 1)
+            self.assertEqual(self.cache.counters()["archive_shared_hit"], 1)
         finally:
             thread.join(5)
 
@@ -183,7 +183,7 @@ class ArchiveTest(CacheTestCase):
         meta = self.cache.ensure_archive(target, wait=0)
         self.assertEqual(meta.size, len(DEFAULT_ARCHIVE))
         self.assertEqual(self.registry.hits["archive"], 1, "we took the download over")
-        self.assertEqual(self.cache.metrics()["locks_broken"], 1)
+        self.assertEqual(self.cache.counters()["locks_broken"], 1)
 
     def test_purge_removes_everything(self):
         self.cache.ensure_archive(ref("consul", "1.0.0"))
@@ -199,7 +199,7 @@ class ArchiveTest(CacheTestCase):
     def test_metrics_are_counted(self):
         self.cache.ensure_archive(ref("consul", "1.0.0"))
         self.cache.versions(CONSUL)
-        metrics = self.cache.metrics()
+        metrics = self.cache.counters()
         self.assertEqual(metrics["versions_miss"], 1)
         self.assertEqual(metrics["archive_fetches"], 1)
         self.assertEqual(metrics["archive_stored"], 1)

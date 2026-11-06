@@ -73,6 +73,7 @@ docker build --target test -t tfproxy-test . && docker run --rm tfproxy-test
 python3 -m tfproxy serve --port 8080 --backend fs --cache-dir .tf-cache
 python3 -m tfproxy prefetch hashicorp/consul/aws          # warm the cache
 python3 -m tfproxy cache --list                            # what the cache holds
+python3 -m tfproxy healthcheck                             # probe the storage, exit 1 if broken
 python3 -m tfproxy info                                    # the resulting configuration
 ```
 
@@ -128,6 +129,16 @@ Every option is available both as an environment variable (`TFP_*`) and as a CLI
 | `TFP_ADMIN_TOKEN` | empty | token for `/api/v1/*` |
 | `TFP_TLS_CERT` / `TFP_TLS_KEY` | empty | HTTPS without a reverse proxy |
 | `TFP_LOG_LEVEL` | `INFO` | logging |
+| `TFP_HEALTH_PROBE_WRITE` | `true` | the storage probe also writes one small object (put → read back → delete) |
+| `TFP_HEALTH_CACHE_TTL` | `5` | seconds a readiness result is reused, so kubelet polling does not hammer the bucket |
+| `TFP_HEALTH_TIMEOUT` | `5` | socket timeout for probes, seconds (much shorter than a normal object operation) |
+| `TFP_STARTUP_CHECK` | `true` | probe the storage once before serving |
+| `TFP_STARTUP_CHECK_RETRIES` | `5` | how many attempts the startup probe gets |
+| `TFP_STARTUP_CHECK_INTERVAL` | `3` | pause between startup probe attempts, seconds |
+| `TFP_STARTUP_REQUIRED` | `false` | exit 1 instead of serving when the startup probe fails |
+| `TFP_READY_STRICT` | `true` | `false` = one healthy backend is enough for `/readyz` (degraded but serving) |
+| `TFP_READY_UPSTREAM` | `false` | a broken upstream registry also fails `/readyz` |
+| `TFP_METRICS_PENDING_SERIES` | `50` | how many per-module pending series `/metrics` exports (`0` = totals only) |
 
 ## S3 and several instances on one bucket
 
@@ -166,14 +177,119 @@ to each instance, so the S3 tier is always the arbiter.
 | GET | `/v1/modules/{ns}/{name}/{prov}/versions` | anyone | the version list (cached) |
 | GET | `/v1/modules/{ns}/{name}/{prov}/{ver}/download` | anyone | `204` + `X-Terraform-Get` |
 | GET/HEAD | `/archive/{ns}/{name}/{prov}/{ver}.zip` | anyone | the archive bytes |
-| GET | `/healthz` | anyone | status, backends, queue, lock statistics |
+| GET | `/healthz` | anyone | liveness: status, backends, queue, lock statistics — never touches the network |
+| GET | `/readyz` | anyone | readiness: probes the storage backends (and with `TFP_READY_UPSTREAM`, the registry) |
 | GET | `/metrics` | anyone | Prometheus text format |
 | GET | `/api/v1/cache` | admin | what is cached + counters |
+| GET | `/api/v1/pending` | admin | requested module versions that are still not in storage |
 | POST | `/api/v1/prefetch` | admin | warm the cache: `{"namespace","name","provider","versions"}` |
 | DELETE | `/api/v1/cache/{ns}/{name}/{prov}[/{ver}]` | admin | drop a module or a version |
 
 Response headers: `X-TFP-Cache: hit|miss|stale|stale-on-error`, `X-TFP-Source: proxy|upstream`,
 `ETag` (the sha256 of the archive), `Retry-After: 5` on `503 download_in_progress`.
+
+## Health checks
+
+Three ways to ask the same question, at three different costs:
+
+| Check | Question | Fails when |
+|---|---|---|
+| `GET /healthz` | is the process wedged? | nothing but a dead process: it never touches the network |
+| `GET /readyz` | can this instance serve a real `terraform init` right now? | a storage backend does not answer (or the registry, with `TFP_READY_UPSTREAM=true`) |
+| `tfproxy healthcheck` | the same, once, from the command line | exit code 1, JSON report on stdout |
+
+* A storage probe is a `ListObjectsV2` with `max-keys=1` plus, by default, one small
+  write → read back → delete round trip. Read-only credentials pass a read probe and then fail
+  every download, which is why the write is on; `TFP_HEALTH_PROBE_WRITE=false` turns it off. The
+  probe reports the S3 error code (`AccessDenied`, `NoSuchBucket`, `SignatureDoesNotMatch`) rather
+  than a bare HTTP status.
+* The write probe writes `health/probe-<host>-<pid>.json`, not one shared object: two replicas on
+  one bucket would otherwise delete each other's file and report a read-back mismatch that is not
+  real.
+* The result is cached for `TFP_HEALTH_CACHE_TTL` seconds, so a kubelet polling every 5 s does not
+  put thousands of LIST calls on the bucket. `GET /readyz?force=1` skips the cache.
+* The same checks run once at startup, with `TFP_STARTUP_CHECK_RETRIES` attempts, so a bucket that
+  is mid-restart gets a chance. By default the proxy starts anyway and only reports "not ready";
+  `TFP_STARTUP_REQUIRED=true` makes a failed startup fatal instead.
+* `TFP_READY_STRICT=false` keeps an instance in rotation while at least one tier is healthy —
+  the disk serving while the bucket is away — instead of taking every pod out at once.
+
+```bash
+tfproxy healthcheck                # JSON report, exit 1 when something is broken
+tfproxy healthcheck --pending      # plus what is still waiting to be downloaded
+tfproxy healthcheck --read-only    # skip the write probe
+```
+
+### Kubernetes
+
+`examples/kubernetes.yaml` is a working Deployment + Service; the probe block is the part that
+matters:
+
+```yaml
+startupProbe:                       # not ready until the bucket answers; 30 x 5s budget
+  httpGet: {path: /readyz, port: http}
+  periodSeconds: 5
+  failureThreshold: 30
+readinessProbe:
+  httpGet: {path: /readyz, port: http}
+  periodSeconds: 10
+livenessProbe:
+  httpGet: {path: /healthz, port: http}
+  periodSeconds: 10
+```
+
+Keep liveness on `/healthz`: pointing it at `/readyz` turns an object-storage outage into a restart
+storm, and the proxy has a warm cache it can serve while the bucket is away.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text format 0.0.4, written by hand (`tfproxy/metrics.py`) — the
+image has no client library to keep in step with the server.
+
+| Series | Type | What it answers |
+|---|---|---|
+| `tfproxy_upstream_requests_total{op,result}` | counter | calls to the registry, `result` = `ok`, `error`, `not_found` |
+| `tfproxy_upstream_errors_total{op,reason}` | counter | failed registry calls, `reason` = `unreachable`, `http_503`, `malformed`, … |
+| `tfproxy_upstream_consecutive_failures{op}` | gauge | failures in a row, reset by the next success |
+| `tfproxy_upstream_last_success_timestamp_seconds{op}` | gauge | when the registry last answered |
+| `tfproxy_upstream_request_seconds{op}` | histogram | how long the registry takes |
+| `tfproxy_archive_pending_modules` | gauge | versions clients asked for that are still not in storage |
+| `tfproxy_archive_pending_oldest_seconds` | gauge | how long the oldest of them has been waiting |
+| `tfproxy_archive_pending_age_seconds{module,version}` | gauge | the same per module (capped by `TFP_METRICS_PENDING_SERIES`) |
+| `tfproxy_archive_downloads_total{result}` | counter | archive fetches from the origin: `ok`, `error`, `store_error`, `not_cacheable` |
+| `tfproxy_archive_download_seconds` | histogram | time to fetch and store one archive |
+| `tfproxy_http_requests_total{route,method,status}` | counter | everything the proxy answered, by route and status class |
+| `tfproxy_http_errors_total{route,code}` | counter | 4xx/5xx answers, labelled with the protocol error code |
+| `tfproxy_http_request_seconds{route}` | histogram | request latency per route |
+| `tfproxy_storage_probe_up{backend}`, `tfproxy_storage_probe_seconds{backend}` | gauge | last probe result per backend |
+| `tfproxy_storage_errors_total{op}` | counter | storage failures the proxy swallowed instead of failing a request |
+| `tfproxy_jobs{name}`, `tfproxy_locks{name}` | gauge | background queue and distributed lock counters |
+| `tfproxy_uptime_seconds`, `tfproxy_process_threads`, `tfproxy_process_max_rss_bytes`, `tfproxy_build_info{version}` | gauge | the process itself |
+| `tfproxy_versions_hit`, `tfproxy_archive_fetches`, … | counter | the cache counters also visible in `/api/v1/cache` |
+
+Three alerts worth wiring up first (`examples/prometheus-alerts.yaml` has them ready):
+
+```yaml
+# 1. the upstream registry is failing us — 404s are deliberately not counted here
+- alert: TerraformRegistryUnreachable
+  expr: increase(tfproxy_upstream_errors_total[5m]) > 3
+
+# 2. nothing has come from the registry for 5 minutes, even at low traffic
+- alert: TerraformRegistrySilent
+  expr: time() - tfproxy_upstream_last_success_timestamp_seconds > 300
+
+# 3. someone asked for a module and 10 minutes later it still is not in storage
+- alert: TerraformModulesNotDownloaded
+  expr: tfproxy_archive_pending_oldest_seconds > 600
+```
+
+`tfproxy_archive_pending_modules > 0` is the softer version of the third alert: it says "a download
+is outstanding", which is normal for a few seconds and a problem after ten minutes.
+
+`/metrics` is unauthenticated, because Prometheus scrapes without credentials. Every series above is
+aggregate except `tfproxy_archive_pending_age_seconds{module,version}`, which names the modules you
+serve — that one is opt-in (`TFP_METRICS_PENDING_SERIES`, default `0` = totals only). Keep the scrape
+port inside the cluster network, or front it with whatever your Prometheus uses to authenticate.
 
 ## Tests
 

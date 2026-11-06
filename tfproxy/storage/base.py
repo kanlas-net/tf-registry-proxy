@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import socket
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
 DEFAULT_CHUNK = 256 * 1024
+
+#: Key used by the write probe. It lives inside the proxy's own tree, never a module key.
+PROBE_KEY = "health/probe.json"
+#: Per-process write-probe keys start here, so replicas sharing a bucket never collide.
+PROBE_KEY_PREFIX = "health/probe-"
 
 
 @dataclass
@@ -70,6 +78,26 @@ class StreamHandle:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+@dataclass
+class ProbeResult:
+    """Outcome of one reachability check against one backend."""
+
+    backend: str
+    ok: bool
+    detail: str = ""
+    write: bool = False
+    seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "backend": self.backend,
+            "ok": self.ok,
+            "write": self.write,
+            "detail": self.detail,
+            "seconds": round(self.seconds, 4),
+        }
 
 
 class Storage(ABC):
@@ -152,6 +180,54 @@ class Storage(ABC):
 
     def describe(self) -> dict[str, str]:
         return {"backend": self.name}
+
+    # ---- health ------------------------------------------------------------
+    def probe(self, write: bool = False) -> ProbeResult:
+        """Is this backend usable right now? Never raises.
+
+        The default asks for one key, which proves connectivity, credentials and bucket
+        existence for a network backend without transferring anything. Backends override
+        it with something cheaper or more meaningful.
+        """
+        started = time.perf_counter()
+        ok, detail = True, "reachable"
+        try:
+            self.stat(PROBE_KEY)
+        except Exception as exc:  # noqa: BLE001 - a probe reports failures, it never raises
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        if ok and write:
+            ok, detail = self.probe_write()
+        return ProbeResult(self.name, ok, detail, write, time.perf_counter() - started)
+
+    def probes(self, write: bool = False) -> list[ProbeResult]:
+        """Every backend this object answers for (a tiered storage has several)."""
+        return [self.probe(write)]
+
+    def probe_write(self, key: Optional[str] = None) -> tuple[bool, str]:
+        """Write, read back and delete one small object. Returns ``(ok, detail)``.
+
+        The object is unique to this process: two replicas sharing a bucket must not
+        delete each other's probe and report a read-back mismatch that is not real.
+        A failed write is not cleaned up - there is nothing of ours to remove.
+        """
+        key = key or f"{PROBE_KEY_PREFIX}{socket.gethostname()}-{os.getpid()}.json"
+        payload = f"tf-registry-proxy probe {time.time()}".encode("utf-8")
+        try:
+            self.put_bytes(key, payload, content_type="application/json", meta={"probe": "true"})
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            return False, f"write failed: {type(exc).__name__}: {exc}"
+        try:
+            body = self.read_or_none(key)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            body = None
+        finally:
+            try:
+                self.delete(key)
+            except Exception:  # pragma: no cover - a leftover probe object is not an outage
+                pass
+        if body != payload:
+            return False, "the object read back is not the object written"
+        return True, "write, read and delete ok"
 
 
 def hash_file(path: str) -> tuple[str, int]:

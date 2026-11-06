@@ -7,6 +7,7 @@ Cloudflare R2, Ceph RGW, LocalStack) through ``endpoint_url``.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import urllib.error
 import urllib.request
@@ -23,7 +24,7 @@ from ..sigv4 import (
     sha256_file,
     sign_request,
 )
-from .base import ObjectMeta, Storage, StreamHandle
+from .base import ObjectMeta, ProbeResult, Storage, StreamHandle
 
 _RETRY_STATUS = (500, 502, 503, 504)
 _META_HEADER = "x-amz-meta-"
@@ -44,6 +45,7 @@ class S3Storage(Storage):
         opener: Optional[Callable[..., object]] = None,
         retries: int = 2,
         timeout: float = 60.0,
+        probe_timeout: float = 5.0,
     ) -> None:
         config.validate()
         self.cfg = config
@@ -51,6 +53,8 @@ class S3Storage(Storage):
         self._opener = opener or urllib.request.urlopen
         self.retries = retries
         self.timeout = timeout
+        #: A health probe must answer long before a normal object operation would.
+        self.probe_timeout = probe_timeout if probe_timeout > 0 else timeout
 
     # ---- addressing --------------------------------------------------------
     def _base_url(self) -> str:
@@ -98,7 +102,9 @@ class S3Storage(Storage):
         headers: Optional[dict[str, str]] = None,
         content_length: Optional[int] = None,
         payload_hash: str = EMPTY_SHA256,
+        timeout: Optional[float] = None,
     ):
+        socket_timeout = timeout or self.timeout
         scheme, host, raw_path = self._host_and_path(self.full_key(key))
         canon_path = canonical_uri(raw_path)
         canon_query = canonical_querystring(query)
@@ -129,9 +135,12 @@ class S3Storage(Storage):
             for name, value in signed.items():
                 request.add_header(name, value)
             try:
-                return self._opener(request, timeout=self.timeout)
+                return self._opener(request, timeout=socket_timeout)
             except urllib.error.HTTPError as exc:
                 if exc.code in _RETRY_STATUS and attempt < self.retries:
+                    # Release the failed response before retrying, or its connection stays
+                    # checked out of the pool for the life of the process.
+                    exc.close()
                     attempt += 1
                     time.sleep(min(0.4 * attempt, 2.0))
                     continue
@@ -352,6 +361,34 @@ class S3Storage(Storage):
             "path_style": str(self.path_style),
         }
 
+    # ---- health ------------------------------------------------------------
+    def probe(self, write: bool = False) -> ProbeResult:
+        """List one key: proves DNS, TLS, credentials and that the bucket exists.
+
+        A ``HEAD`` on a known key answers 404 for a wrong bucket name too, so the probe
+        uses ListObjectsV2 and reports the S3 error code (``AccessDenied``,
+        ``NoSuchBucket``, ``SignatureDoesNotMatch``) instead of a bare status.
+        """
+        started = time.perf_counter()
+        query = {"list-type": "2", "max-keys": "1"}
+        if self.cfg.prefix:
+            query["prefix"] = self.cfg.prefix
+        ok, detail = True, ""
+        try:
+            with self._request("GET", "", query=query, timeout=self.probe_timeout) as response:
+                detail = f"bucket {self.cfg.bucket} answered HTTP {getattr(response, 'status', 200)}"
+        except urllib.error.HTTPError as exc:
+            code = _s3_error_code(exc)
+            exc.close()
+            detail = f"HTTP {exc.code}" + (f" {code}" if code else "")
+            ok = False
+        except (urllib.error.URLError, StorageError, OSError) as exc:
+            reason = getattr(exc, "reason", None) or exc
+            ok, detail = False, f"{type(exc).__name__}: {reason}"
+        if ok and write:
+            ok, detail = self.probe_write()
+        return ProbeResult(self.name, ok, detail or "reachable", write, time.perf_counter() - started)
+
 
 def _flatten(root: ET.Element) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
@@ -360,6 +397,16 @@ def _flatten(root: ET.Element) -> list[tuple[str, str]]:
         if element.text and element.text.strip():
             out.append((name, element.text.strip()))
     return out
+
+
+def _s3_error_code(exc: BaseException) -> str:
+    """Pull ``<Code>`` out of an S3 error body: "AccessDenied" reads better than "HTTP 403"."""
+    try:
+        body = exc.read(2048)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - body already consumed or unreadable
+        return ""
+    match = re.search(rb"<Code>([^<]{1,64})</Code>", body or b"")
+    return match.group(1).decode("ascii", "replace") if match else ""
 
 
 def _safe_header(value: str) -> str:

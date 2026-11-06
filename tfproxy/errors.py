@@ -35,10 +35,15 @@ class Unauthorized(ProxyError):
 
 
 class UpstreamError(ProxyError):
-    """The upstream registry answered with an error or could not be reached."""
+    """The upstream registry answered with an error or could not be reached.
 
-    def __init__(self, status: int, message: str, code: str = "upstream_error") -> None:
+    ``reason`` is a short, bounded label for metrics (``unreachable``, ``http_503``,
+    ``malformed``): the message is for a human and must never become a label value.
+    """
+
+    def __init__(self, status: int, message: str, code: str = "upstream_error", reason: str = "") -> None:
         super().__init__(status, code, message)
+        self.reason = reason or "error"
 
 
 class StorageError(Exception):

@@ -13,24 +13,27 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterator, Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .cache import CacheService
 from .config import Config
 from .errors import BadRequest, NotFound, ProxyError, Unauthorized
+from .health import HealthService
 from .locking import LockManager, NullLockManager
+from .metrics import Metrics
 from .models import ModuleRef
+from .pending import PendingLedger
 from .storage.base import Storage
 from .upstream import X_TERRAFORM_GET
 from .workers import BackgroundQueue
 
 JSON_TYPE = "application/json"
 MAX_ADMIN_BODY = 64 * 1024
-_START = time.time()
 
 _ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(r"^/\.well-known/terraform\.json/?$"), "discovery"),
     ("GET", re.compile(r"^/healthz/?$"), "health"),
+    ("GET", re.compile(r"^/readyz/?$"), "ready"),
     ("GET", re.compile(r"^/metrics/?$"), "metrics"),
     ("GET", re.compile(r"^/?$"), "index"),
     ("GET", re.compile(r"^/v1/modules/(?P<ns>[^/]+)/(?P<name>[^/]+)/(?P<prov>[^/]+)/versions/?$"), "versions"),
@@ -41,6 +44,7 @@ _ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ),
     ("GET", re.compile(r"^/archive/(?P<ns>[^/]+)/(?P<name>[^/]+)/(?P<prov>[^/]+)/(?P<ver>[^/]+)\.zip$"), "archive"),
     ("GET", re.compile(r"^/api/v1/cache/?$"), "cache_list"),
+    ("GET", re.compile(r"^/api/v1/pending/?$"), "pending_list"),
     ("POST", re.compile(r"^/api/v1/prefetch/?$"), "prefetch"),
     (
         "DELETE",
@@ -85,12 +89,16 @@ class ProxyApplication:
         storage: Storage,
         queue: BackgroundQueue,
         logger: Optional[logging.Logger] = None,
+        metrics: Optional[Metrics] = None,
+        health: Optional[HealthService] = None,
     ) -> None:
         self.config = config
         self.cache = cache
         self.storage = storage
         self.queue = queue
         self.logger = logger or logging.getLogger("tfproxy.http")
+        self.metrics = metrics if metrics is not None else Metrics()
+        self.health = health if health is not None else HealthService(config, storage, metrics=self.metrics, registry=cache.registry)
 
     # ---- entry point -------------------------------------------------------
     def handle(
@@ -106,6 +114,7 @@ class ProxyApplication:
         path = path or "/"
         head_request = method == "HEAD"
         probe = "GET" if head_request else method
+        started = time.perf_counter()
 
         for name, pattern in [(n, p) for verb, p, n in _ROUTES if verb == probe]:
             match = pattern.match(path)
@@ -115,20 +124,26 @@ class ProxyApplication:
             # first would let %2F, %3F or %23 rewrite the route itself, and a decoded
             # separator or '?' inside a segment must reach validation as a plain bad id.
             params = {key: unquote(value) for key, value in match.groupdict().items()}
+            code = ""
             try:
                 response = getattr(self, f"_on_{name}")(params, headers, body, query, method)
             except ProxyError as exc:
+                code = exc.code
                 response = self._error(exc.status, exc.code, exc.message, exc.headers)
             except Exception as exc:  # pragma: no cover - last line of defence
+                code = "internal_error"
                 self.logger.exception("unhandled error on %s %s", method, path)
                 response = self._error(500, "internal_error", f"{type(exc).__name__}: {exc}")
+            self.metrics.observe_http(name, method, response.status, time.perf_counter() - started, code)
             if head_request:
                 if response.content_length is None and response.body is not None:
                     response.content_length = len(response.body)
                 response.body = None
                 response.stream = None
             return response
-        return self._error(404, "no_route", f"no handler for {method} {path}")
+        response = self._error(404, "no_route", f"no handler for {method} {path}")
+        self.metrics.observe_http("unknown", method, 404, time.perf_counter() - started, "no_route")
+        return response
 
     # ---- discovery / ops ---------------------------------------------------
     def _on_discovery(self, _params, _headers, _body, _query, _method) -> Response:
@@ -145,6 +160,7 @@ class ProxyApplication:
         )
 
     def _on_health(self, _params, _headers, _body, _query, _method) -> Response:
+        """Liveness: the process is up and its threads are running. Never touches the network."""
         stats = self.queue.stats()
         return self._json(
             200,
@@ -153,18 +169,39 @@ class ProxyApplication:
                 "backends": self.storage.describe(),
                 "queued": stats["queued"],
                 "active": stats["active"],
+                "pending": self.cache.pending.stats()["pending"],
                 "instance": self.cache.locks.instance,
                 "locks": self.cache.locks.stats(),
             },
         )
 
+    def _on_ready(self, _params, _headers, _body, query, _method) -> Response:
+        """Readiness: can this instance serve a real ``terraform init`` right now?
+
+        Storage must answer (and, with ``TFP_READY_UPSTREAM``, the registry too). Pass
+        ``?force=1`` to skip the short result cache and probe right now.
+        """
+        report = self.health.check(force=_wants_force(query))
+        payload = report.to_dict()
+        stats = self.queue.stats()
+        pending = self.cache.pending.stats()
+        payload.update(
+            {
+                "backends": self.storage.describe(),
+                "instance": self.cache.locks.instance,
+                "queued": stats["queued"],
+                "active": stats["active"],
+                "pending": {"modules": pending["pending"], "oldest_seconds": pending["oldest_seconds"]},
+            }
+        )
+        return self._json(200 if report.ok else 503, payload, {"Cache-Control": "no-store"})
+
     def _on_metrics(self, _params, _headers, _body, _query, _method) -> Response:
-        lines = [f"tfproxy_{name} {value}" for name, value in sorted(self.cache.metrics().items())]
-        lines.append(f"tfproxy_uptime_seconds {int(self.cache.clock() - _START)}")
+        self.metrics.refresh(self.cache)
         return Response(
             status=200,
-            headers={"Content-Type": "text/plain; version=0.0.4"},
-            body="\n".join(lines).encode("utf-8"),
+            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+            body=self.metrics.registry.render().encode("utf-8"),
         )
 
     # ---- registry protocol -------------------------------------------------
@@ -242,6 +279,7 @@ class ProxyApplication:
     def _on_cache_list(self, _params, headers, _body, _query, _method) -> Response:
         self._require_admin(headers)
         objects = self.cache.cached_modules()
+        pending = self.cache.pending.stats()
         return self._json(
             200,
             {
@@ -250,11 +288,20 @@ class ProxyApplication:
                     {"/".join(key.split("/")[1:4]) for key in objects if key.startswith("modules/")}
                 ),
                 "keys": objects,
-                "metrics": self.cache.metrics(),
+                "metrics": self.cache.counters(),
                 "jobs": self.queue.stats(),
+                "pending": {"modules": pending["pending"], "oldest_seconds": pending["oldest_seconds"]},
                 "backends": self.storage.describe(),
             },
         )
+
+    def _on_pending_list(self, _params, headers, _body, _query, _method) -> Response:
+        """What clients asked for that is still not in storage, oldest first."""
+        self._require_admin(headers)
+        stats = self.cache.pending.stats()
+        now = time.time()
+        stats["entries"] = [entry.to_dict(now) for entry in stats["entries"]]
+        return self._json(200, stats)
 
     def _on_prefetch(self, _params, headers, body, _query, _method) -> Response:
         self._require_admin(headers)
@@ -314,6 +361,14 @@ class ProxyApplication:
             headers=merged,
             body=error_body(code, message),
         )
+
+
+def _wants_force(query: Optional[str]) -> bool:
+    """``?force`` skips the probe cache, ``?force=0`` does not."""
+    values = parse_qs(query or "").get("force")
+    if values is None:
+        return False
+    return values[0].strip().lower() not in ("", "0", "false", "no")
 
 
 def _closing_stream(handle) -> Iterator[bytes]:
@@ -445,11 +500,13 @@ class ProxyServer(ThreadingHTTPServer):
 
 def build_application(config: Config) -> tuple[ProxyApplication, Storage, BackgroundQueue]:
     """Wire storage + upstream client + background queue into an application."""
+    from . import __version__
     from .storage import build_storage
     from .upstream import ArchiveDownloader, RegistryClient
 
     logger = logging.getLogger("tfproxy")
     storage = build_storage(config)
+    metrics = Metrics(version=__version__, max_pending_series=config.metrics_pending_series)
     registry = RegistryClient(
         config.upstream_url,
         request_timeout=config.request_timeout,
@@ -470,9 +527,23 @@ def build_application(config: Config) -> tuple[ProxyApplication, Storage, Backgr
     else:
         locks = NullLockManager(ttl=config.lock_ttl, logger=logger.getChild("locks"))
     cache = CacheService(
-        config=config, storage=storage, registry=registry, downloader=downloader, queue=queue, locks=locks
+        config=config,
+        storage=storage,
+        registry=registry,
+        downloader=downloader,
+        queue=queue,
+        locks=locks,
+        metrics=metrics,
+        pending=PendingLedger(logger=logger.getChild("pending")),
     )
-    app = ProxyApplication(config, cache, storage, queue)
+    app = ProxyApplication(
+        config,
+        cache,
+        storage,
+        queue,
+        metrics=metrics,
+        health=HealthService(config, storage, metrics=metrics, registry=registry, logger=logger.getChild("health")),
+    )
     return app, storage, queue
 
 
@@ -487,8 +558,13 @@ def make_server(config: Config, app: Optional[ProxyApplication] = None) -> Proxy
     return server
 
 
-def serve(config: Config) -> None:
-    """Run until SIGINT/SIGTERM, then shut the worker threads down cleanly."""
+def serve(config: Config) -> int:
+    """Run until SIGINT/SIGTERM, then shut the worker threads down cleanly.
+
+    The socket is bound before the startup probe runs, so kubelet can watch ``/readyz``
+    go from 503 to 200 instead of getting a connection refused. Returns the process exit
+    code: 1 when the startup probe failed and ``TFP_STARTUP_REQUIRED`` is on.
+    """
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -517,8 +593,21 @@ def serve(config: Config) -> None:
                 signal.signal(getattr(signal, name), _shutdown)
             except (ValueError, OSError):  # pragma: no cover - not the main thread
                 pass
+    code = 0
     try:
-        stop.wait()
+        if config.startup_check:
+            report = app.health.run_startup_checks()
+            if not report.ok and config.startup_required:
+                log.error(
+                    "startup check failed (%s) and TFP_STARTUP_REQUIRED is on: exiting instead of serving",
+                    report.reason,
+                )
+                code = 1
+            else:
+                stop.wait()
+        else:
+            log.info("startup check disabled (TFP_STARTUP_CHECK=false)")
+            stop.wait()
     except KeyboardInterrupt:  # pragma: no cover
         pass
     finally:
@@ -526,3 +615,4 @@ def serve(config: Config) -> None:
         server.server_close()
         queue.shutdown(wait=True)
         log.info("stopped")
+    return code

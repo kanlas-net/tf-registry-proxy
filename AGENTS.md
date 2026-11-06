@@ -62,6 +62,20 @@ ran it.
    draft instead of deleting it, and `gh release view` still finds drafts, so a step that only
    checks existence skips publishing forever. Guarded by
    `test_a_leftover_draft_release_is_published_not_skipped`.
+11. **Liveness never touches the network.** `/healthz` stays a local check, so an S3 outage cannot
+   restart every pod. Anything that probes storage belongs on `/readyz` (and in
+   `tfproxy healthcheck`), and its result is cached for `TFP_HEALTH_CACHE_TTL` because kubelet polls
+   far more often than a bucket should be LISTed. See `tests.test_health`.
+12. **Metric labels come from a bounded set** (route, op, result, reason, backend). A module id
+   only ever reaches a label through `tfproxy_archive_pending_age_seconds`, which is capped by
+   `TFP_METRICS_PENDING_SERIES` and forgets the series that disappeared. Error *messages* are never
+   labels — that is what `UpstreamError.reason` is for.
+
+## Naming trap
+
+`cache.metrics` is the Prometheus bundle; the counter snapshot served by `/api/v1/cache` is
+`cache.counters()`. They used to share the name, and a `Metrics object is not callable` is that
+clash reappearing.
 
 ## Layout
 
@@ -71,7 +85,10 @@ ran it.
 | `tfproxy/cache.py` | TTL document cache, stale-while-revalidate, `stale-on-error` |
 | `tfproxy/workers.py` | background queue: the "answer now, download later" half |
 | `tfproxy/locking.py` | distributed download locks (`LockManager`) |
-| `tfproxy/storage/` | `base` interface, `fs`, `s3`, `multi` (tiered: read first hit, write all) |
+| `tfproxy/health.py` | liveness vs readiness, the storage/upstream probes, the startup retry loop |
+| `tfproxy/metrics.py` | hand-written Prometheus registry and the `Metrics` bundle (every exported series) |
+| `tfproxy/pending.py` | ledger of "a client asked for it, storage does not have it yet" |
+| `tfproxy/storage/` | `base` interface (+ probes), `fs`, `s3`, `multi` (tiered: read first hit, write all) |
 | `tfproxy/upstream.py` | HTTP client for the registry and for archive downloads |
 | `tfproxy/sigv4.py` | hand-written AWS Signature V4 |
 | `tfproxy/models.py` | module refs, storage keys, go-getter source parsing |
@@ -111,6 +128,11 @@ Each of these was a real bug found in review; the surrounding tests exist becaus
 - `workers.start()` clears `_stop`, so a queue can be restarted.
 - `StreamHandle.chunks()` raises `ValueError` after close.
 - `config._env_bool` raises `ConfigError` on a value that is not a boolean.
+- `storage/s3.py`: `probe()` uses `probe_timeout`, not the 60 s object timeout — a readiness probe
+  must not hold a kubelet check for a minute.
+- `metrics.py`: a pending limit of `0` means "no per-module series", not "unlimited", and gauges
+  built from a snapshot must `forget()` the label combinations that vanished, or a module cached an
+  hour ago keeps reporting an age forever.
 
 ## Releasing
 

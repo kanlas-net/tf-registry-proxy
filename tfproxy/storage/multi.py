@@ -8,7 +8,7 @@ import tempfile
 from typing import Optional
 
 from ..errors import NotFound
-from .base import ObjectMeta, Storage, StreamHandle
+from .base import ObjectMeta, ProbeResult, Storage, StreamHandle
 
 LOGGER = logging.getLogger("tfproxy.storage.tiered")
 
@@ -32,6 +32,17 @@ class TieredStorage(Storage):
 
     def describe(self) -> dict[str, str]:
         return {"backend": self.name, "tiers": "+".join(b.name for b in self.backends)}
+
+    # ---- health ------------------------------------------------------------
+    def probes(self, write: bool = False) -> list[ProbeResult]:
+        """Probe every tier on its own: a dead S3 next to a healthy disk is a real finding."""
+        return [backend.probe(write) for backend in self.backends]
+
+    def probe(self, write: bool = False) -> ProbeResult:
+        results = self.probes(write)
+        broken = [result for result in results if not result.ok]
+        detail = "; ".join(f"{result.backend}: {result.detail}" for result in results)
+        return ProbeResult(self.name, not broken, detail, write, sum(result.seconds for result in results))
 
     # ---- locking -----------------------------------------------------------
     @property

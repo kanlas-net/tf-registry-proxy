@@ -343,6 +343,51 @@ class ReadmeTest(unittest.TestCase):
         self.assertIn("modules.v1", example)
         self.assertIn("registry.terraform.io", example)
 
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_kubernetes_example_probes_the_right_endpoints(self):
+        """A readiness probe aimed at ``/healthz`` silently defeats the whole point.
+
+        Liveness must stay local: if it probes the bucket, an S3 outage restarts every pod
+        instead of just draining them.
+        """
+        import yaml
+
+        documents = [doc for doc in yaml.safe_load_all(read("examples/kubernetes.yaml")) if doc]
+        deployment = next(doc for doc in documents if doc.get("kind") == "Deployment")
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        paths = {
+            name: container[name]["httpGet"]["path"]
+            for name in ("startupProbe", "readinessProbe", "livenessProbe")
+        }
+        self.assertEqual(paths, {"startupProbe": "/readyz", "readinessProbe": "/readyz", "livenessProbe": "/healthz"})
+        names = {port["name"] for port in container["ports"]}
+        for name in ("startupProbe", "readinessProbe", "livenessProbe"):
+            self.assertIn(container[name]["httpGet"]["port"], names)
+        service = next(doc for doc in documents if doc.get("kind") == "Service")
+        self.assertEqual(service["spec"]["selector"], deployment["spec"]["selector"]["matchLabels"])
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_alert_rules_only_use_exported_metrics(self):
+        """An alert on a metric the proxy never writes is discovered during the incident."""
+        import yaml
+
+        from tfproxy.metrics import Metrics
+
+        document = yaml.safe_load(read("examples/prometheus-alerts.yaml"))
+        rules = [rule for group in document["spec"]["groups"] for rule in group["rules"]]
+        self.assertTrue(rules, "the example must actually carry rules")
+        registry = Metrics().registry
+        exported: set[str] = set()
+        for name in registry.names():
+            exported.add(name)
+            metric = registry.metric(name)
+            if metric is not None and metric.kind == "histogram":
+                exported.update({f"{name}_bucket", f"{name}_count", f"{name}_sum"})
+        used = set(re.findall(r"tfproxy_[a-z_]+", read("examples/prometheus-alerts.yaml")))
+        self.assertTrue(used)
+        unknown = sorted(name for name in used if name not in exported)
+        self.assertEqual(unknown, [], f"alerts use metrics that are never exported: {unknown}")
+
     def test_documented_endpoints_are_routed(self):
         from tfproxy.server import _ROUTES
 
@@ -353,7 +398,9 @@ class ReadmeTest(unittest.TestCase):
             ("/archive/{ns}/{name}/{prov}/{ver}.zip", "archive"),
             ("/.well-known/terraform.json", "well-known"),
             ("/api/v1/prefetch", "prefetch"),
+            ("/api/v1/pending", "pending"),
             ("/healthz", "healthz"),
+            ("/readyz", "readyz"),
             ("/metrics", "metrics"),
         ):
             with self.subTest(route=placeholder):

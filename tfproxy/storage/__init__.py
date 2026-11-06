@@ -7,7 +7,16 @@ from .fs import FilesystemStorage
 from .multi import TieredStorage
 from .s3 import S3Storage
 
-__all__ = ["ObjectMeta", "StreamHandle", "Storage", "FilesystemStorage", "S3Storage", "TieredStorage", "build_storage"]
+__all__ = [
+    "ObjectMeta",
+    "ProbeResult",
+    "StreamHandle",
+    "Storage",
+    "FilesystemStorage",
+    "S3Storage",
+    "TieredStorage",
+    "build_storage",
+]
 
 
 def build_storage(config) -> Storage:
@@ -21,7 +30,7 @@ def build_storage(config) -> Storage:
         elif name == "s3":
             if config.s3 is None:
                 raise ConfigError("backend 's3' selected but S3 is not configured")
-            backends.append(S3Storage(config.s3))
+            backends.append(S3Storage(config.s3, probe_timeout=getattr(config, "health_timeout", 5.0)))
         else:  # pragma: no cover - validated in Config.validate()
             raise ConfigError(f"unknown backend {name!r}")
     if len(backends) == 1:
